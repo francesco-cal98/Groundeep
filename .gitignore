@@ -1,0 +1,18 @@
+# Ignora file Python compilati
+*.pyc
+__pycache__/
+
+# Ignora cartelle specifiche
+.venv/
+node_modules/
+
+# Ignora file di configurazione locali
+config.local.json
+
+# Ignora file temporanei
+*.tmp
+
+*.mat
+*.pkl
+lightning_logs/
+.vscode/
