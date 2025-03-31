@@ -11,8 +11,13 @@ config.local.json
 
 # Ignora file temporanei
 *.tmp
+training_tensors/
 
-*.mat
+*.mat 
 *.pkl
+logs/
 lightning_logs/
 .vscode/
+.*pt
+logs-gdbn/
+src/notebooks/model_coefficients_results_5.xlsx

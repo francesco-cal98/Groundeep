@@ -3,6 +3,13 @@ import torch
 import torch.nn as nn
 import pickle
 from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+import random
+import os
+
+
+
+
 
 # Utility function for sigmoid activation
 def sigmoid(x):
@@ -42,48 +49,53 @@ class RBM(nn.Module):
     def train_epoch(self, data, epoch, max_epochs, CD=1):
         total_loss = 0.0
         lr = self.lr / (1 + 0.01 * epoch) if self.dynamic_lr else self.lr
-        batch_size = data.size(1)
+        batch_size = data.size(0)
         momentum = self.momentum if epoch <= 5 else self.final_momentum
-        for batch_idx in range(data.size(0)):
-            batch_data = data[batch_idx]
+       
+        with torch.no_grad():
+            
+            # Positive phase
+            pos_hid_probs = self.forward(data)
+            pos_hid_states = (pos_hid_probs > torch.rand_like(pos_hid_probs)).float()
+            pos_assoc = torch.matmul(data.T, pos_hid_probs)
 
-            with torch.no_grad():
-                # Positive phase
-                pos_hid_probs = self.forward(batch_data)
-                pos_hid_states = (pos_hid_probs > torch.rand_like(pos_hid_probs)).float()
-                pos_assoc = torch.matmul(batch_data.T, pos_hid_probs)
+            # Negative phase
+            neg_data = data
+            for _ in range(CD):
+                neg_vis_probs = self.backward(pos_hid_states)
+                neg_data = (neg_vis_probs > torch.rand_like(neg_vis_probs)).float()
+                neg_hid_probs = self.forward(neg_data)
+                pos_hid_states = (neg_hid_probs > torch.rand_like(neg_hid_probs)).float()
+            neg_assoc = torch.matmul(neg_data.T, neg_hid_probs)
 
-                # Negative phase
-                neg_data = batch_data
-                for _ in range(CD):
-                    neg_vis_probs = self.backward(pos_hid_states)
-                    neg_data = (neg_vis_probs > torch.rand_like(neg_vis_probs)).float()
-                    neg_hid_probs = self.forward(neg_data)
-                    pos_hid_states = (neg_hid_probs > torch.rand_like(neg_hid_probs)).float()
-                neg_assoc = torch.matmul(neg_data.T, neg_hid_probs)
+            # Weight and bias updates
+            self.W_momentum.mul_(momentum).add_(lr * ((pos_assoc - neg_assoc) / batch_size - self.weight_decay * self.W))
+            self.hid_bias_momentum.mul_(momentum).add_(lr * (pos_hid_probs.sum(0) - neg_hid_probs.sum(0)) / batch_size)
+            self.vis_bias_momentum.mul_(momentum).add_(lr * (data.sum(0) - neg_data.sum(0)) / batch_size)
 
-                # Weight and bias updates
-                self.W_momentum.mul_(momentum).add_(lr * ((pos_assoc - neg_assoc) / batch_size - self.weight_decay * self.W))
-                self.hid_bias_momentum.mul_(momentum).add_(lr * (pos_hid_probs.sum(0) - neg_hid_probs.sum(0)) / batch_size)
-                self.vis_bias_momentum.mul_(momentum).add_(lr * (batch_data.sum(0) - neg_data.sum(0)) / batch_size)
+            self.W.add_(self.W_momentum)
+            self.hid_bias.add_(self.hid_bias_momentum)
+            self.vis_bias.add_(self.vis_bias_momentum)
 
-                self.W.add_(self.W_momentum)
-                self.hid_bias.add_(self.hid_bias_momentum)
-                self.vis_bias.add_(self.vis_bias_momentum)
+            batch_loss = torch.sum((data - neg_vis_probs) ** 2) / batch_size
 
-                batch_loss = torch.sum((batch_data - neg_vis_probs) ** 2) / batch_size
-                total_loss += batch_loss.item()
+            torch.cuda.empty_cache()
 
-                torch.cuda.empty_cache()
-
-        return total_loss / data.size(0)
+        return batch_loss
 
 
-# DBN Class
 class gDBN:
-    def __init__(self, layer_sizes, params):
+    def __init__(self, layer_sizes, params, dataloader, device, log_dir="logs-gdbn"):
         self.layers = []
+        self.layer_sizes = layer_sizes
         self.params = params
+        self.dataloader = dataloader
+        self.device = device
+
+        # Generate a unique log directory based on layer sizes
+        layer_sizes_str = "-".join(map(str, layer_sizes))
+        self.log_dir = os.path.join(log_dir, f"gDBN_{layer_sizes_str}")
+
         for i in range(len(layer_sizes) - 1):
             rbm = RBM(
                 num_visible=layer_sizes[i],
@@ -97,25 +109,61 @@ class gDBN:
             self.layers.append(rbm)
 
     def train(self, data, epochs):
+        writer = SummaryWriter(log_dir=self.log_dir)  # Use dynamic log dir
+        all_epoch_losses = {}  # Dictionary to store losses per layer
+
+        # Select 5 random images to log reconstruction
+        sample_images, _ = next(iter(self.dataloader))  # Get first batch
+        sample_images = sample_images[:5].to(self.device)  # Take first 5 images
+
         for layer_idx, rbm in enumerate(self.layers):
-            print(f'Training RBM Layer {layer_idx + 1}')
-            layer_data = data
-            for epoch in tqdm(range(epochs)):
-                loss = rbm.train_epoch(layer_data, epoch, epochs, CD=1)
-                if epoch % 10 == 0:
-                    print(f'Epoch {epoch}, Loss: {loss:.4f}')
-                torch.cuda.empty_cache()
-            data = rbm.forward(data)
+            layer_name = f"RBM_Layer_{layer_idx + 1}"  # Naming each layer
+            print(f'Training {layer_name}')
+            epoch_losses = []  # Store losses for the current layer
+
+            for epoch in range(epochs):
+                total_loss = 0
+                num_batches = 0
+
+                for batch in self.dataloader:
+                    train_data, _ = batch
+                    data = train_data.to(self.device)
+                    batch_loss = rbm.train_epoch(data, epoch, epochs, CD=1)
+                    total_loss += batch_loss
+                    num_batches += 1
+                    torch.cuda.empty_cache()
+
+                # Compute average loss for this epoch
+                avg_epoch_loss = total_loss / num_batches
+                epoch_losses.append(avg_epoch_loss)
+
+                # Log loss to TensorBoard
+                writer.add_scalar(f"Loss/{layer_name}", avg_epoch_loss, epoch)
+
+            all_epoch_losses[layer_name] = epoch_losses  # Store in dictionary
+            data = rbm.forward(train_data)
+
+        writer.close()  # Close the TensorBoard writer
+        return all_epoch_losses  # Return dictionary with layer-wise losses
+
 
     def save(self, path):
+        self.dataloader = None
+        self.writer = None
         with open(path, 'wb') as f:
             pickle.dump(self, f)
 
+
 # iDBN Class
 class iDBN:
-    def __init__(self, layer_sizes, params):
+    def __init__(self, layer_sizes, params,dataloader,device,log_dir= "logs-idbn"):
         self.layers = []
         self.params = params
+        self.dataloader = dataloader
+        self.device = device
+        self.writer = SummaryWriter(log_dir)
+
+
         for i in range(len(layer_sizes) - 1):
             rbm = RBM(
                 num_visible=layer_sizes[i],
@@ -128,28 +176,67 @@ class iDBN:
             )
             self.layers.append(rbm)
 
-    def train(self, data, epochs):
-        for layer_idx, rbm in enumerate(self.layers):
-            print(f'Training iDBN Layer {layer_idx + 1}')
+
+    def train(self, epochs):
+            epoch_losses = []
+
+            # Select 5 random images to log reconstruction
+            sample_images, _ = next(iter(self.dataloader))  # Get first batch
+            sample_images = sample_images[:5].to(self.device)  # Take first 5 images
+
             for epoch in tqdm(range(epochs)):
-                temp_data = data.clone()  # Reset to original data for each epoch
-                for i, rbm_layer in enumerate(self.layers):
-                    print(f"Before Layer {i}: temp_data shape = {temp_data.shape}, W shape = {rbm_layer.W.shape}")
-                    
+                for batch in self.dataloader:
+                    train_data, one_hot = batch 
+                    temp_data = train_data.to(self.device)
                     # Train the current RBM layer
-                    loss = rbm_layer.train_epoch(temp_data, epoch, epochs, CD=1)
-                    
-                    # Generate output for the next layer
-                    temp_data = rbm_layer.forward(temp_data)
-                    print(f"After Layer {i}: temp_data shape = {temp_data.shape}")
-                    
+                    for i, rbm_layer in enumerate(self.layers):
+                        #print(f'Training iDBN Layer {i + 1}')
+                        #print(f"Before Layer {i}: temp_data shape = {temp_data.shape}, W shape = {rbm_layer.W.shape}")
+
+                        batch_loss = rbm_layer.train_epoch(temp_data, epoch, epochs, CD=1)
+                        
+                        # Generate output for the next layer
+                        temp_data = rbm_layer.forward(temp_data)
+                        #print(f"After Layer {i}: temp_data shape = {temp_data.shape}")
+                    epoch_losses.append(batch_loss)
+
+                mean_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0  # Compute mean loss
+
+                self.writer.add_scalar("Loss/train", mean_loss, epoch)
+                # Log reconstructed images every 5 epochs
+
+                if epoch % 5 == 0:
+                    with torch.no_grad():
+                        reconstructed_images = self.reconstruct(sample_images)
+                    self.log_images(sample_images.view(-1,1,100,100), reconstructed_images.view(-1,1,100,100), epoch)
+            
                 if epoch % 10 == 0:
-                    print(f'Epoch {epoch}, Loss: {loss:.4f}')
+                    print(f'Epoch {epoch}, Loss: {mean_loss:.4f}')
                 torch.cuda.empty_cache()
 
+    def log_images(self, original, reconstructed, epoch):
+        """Logs original and reconstructed images to TensorBoard."""
+        images = torch.cat((original, reconstructed), dim=0)  # Stack originals and reconstructions
+        self.writer.add_images("Reconstruction", images, epoch)
+
+
+    def reconstruct(self, data):
+        with torch.no_grad():
+            # Forward pass through the DBN
+            temp_data = data
+            for rbm in self.layers:
+                temp_data = rbm.forward(temp_data)
+
+            # Backward pass through the DBN (reverse order)
+            for rbm in reversed(self.layers):
+                temp_data = rbm.backward(temp_data)
+
+        return temp_data
 
 
     def save(self, path):
+        self.dataloader = None
+        self.writer = None
         with open(path, 'wb') as f:
             pickle.dump(self, f)
 

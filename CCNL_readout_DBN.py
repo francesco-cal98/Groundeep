@@ -9,13 +9,13 @@ import scipy
 from scipy.stats import norm
 import torch
 
-from dbns import DEVICE
 import numpy as np
 import statsmodels.api as sm
 from sklearn.metrics import accuracy_score
 import numpy as np
 from sklearn.metrics import accuracy_score
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
 def forwardrbm(self, v):
     p_h = torch.sigmoid(torch.matmul(v, self.W) + self.hid_bias)
     h = (p_h > torch.rand_like(p_h)).float()  # Stochastic activation
@@ -40,6 +40,7 @@ def forwardDBN(self, X):
     #end
     
     return X
+
 def classifier(Xtrain, Xtest, Ytrain, Ytest):
       # Reshaping the data
     Xtrain = Xtrain.view(-1, Xtrain.shape[2]).detach().cpu().numpy()
@@ -214,17 +215,17 @@ def beta_extraction(choice, idxs, N_list, TSA_list, FA_list, guessRate=0.01):
 
     return model_fit, weber, prob_choice_right, X
 
-
+"""
 layer_sizes = [
     [500, 500], [500, 1000], [500, 1500], [500, 2000], 
     [1000, 500], [1000, 1000], [1000, 1500], [1000, 2000], 
     [1500, 500], [1500, 1000], [1500, 1500], [1500, 2000]
 ]
-path_to_dbn="D:/asya/code/Sep2024/DeWind/python files"
-name_of_dbn="gdbn_trained"
-path_to_train_dataset='D:/asya/code/Sep2024/DeWind/data/pairs_from_mat_train.pkl'
-path_to_test_dataset= 'D:/asya/code/Sep2024/DeWind/data/pairs_from_mat_test.pkl'
-test_file = 'D:/asya/code/Sep2024/DeWind/data/NumStim_7to28_100x100_TE.mat'
+path_to_dbn="/home/student/Desktop/Groundeep"
+name_of_dbn="idbn_trained_zipfian_1000_500.pkl"
+path_to_train_dataset='/home/student/Desktop/Groundeep/pairs_from_mat_train.pkl'
+path_to_test_dataset= '/home/student/Desktop/Groundeep/test_datasetx.pkl'
+test_file = '/home/student/Desktop/Groundeep/NumStim_1to32_100x100_TE.mat'
 output_file = 'model_coefficients_results_5.xlsx'
 # Prepare the results for saving into an Excel file
 results = []
@@ -236,8 +237,6 @@ test_dataset = pickle.load(open(path_to_test_dataset, 'rb'))
 XtestComp, YtestComp, idxs_test = test_dataset['data'].to(DEVICE), test_dataset['labels'].to(DEVICE), test_dataset['idxs'].to(DEVICE)
 for layer_size in layer_sizes:
     from scipy import io
-
-
 
     input_path= f"{path_to_dbn}/{name_of_dbn}_{layer_size[0]}_{layer_size[1]}.pkl"
     with open(input_path, 'rb') as f:
@@ -256,11 +255,8 @@ for layer_size in layer_sizes:
     del _XtestComp1, _XtestComp2
 
 
-
-
     accTR, predTR, acc, choice = classifier(_XtrainComp,  _XtestComp, _YtrainComp, _YtestComp)
    
-
 
     test_contents = io.loadmat(test_file)
 
@@ -294,3 +290,7 @@ results_df.to_excel(output_file, index=False)
 print(f"Results saved to {output_file}")
 
 
+
+
+
+"""

@@ -17,103 +17,109 @@ import math
 def sigmoid(x):
     return 1 / (1 + torch.exp(-x))
 
-class RBM(pl.LightningModule):
-    def __init__(self, num_visible, num_hidden, learning_rate, weight_penalty, momentum, dynamic_lr=False, final_momentum=0.97):
+
+class RBM(nn.Module):
+    def __init__(self, num_visible, num_hidden, learning_rate, weight_decay, momentum, dynamic_lr=False, final_momentum=0.97,batch_size = 10):
         super(RBM, self).__init__()
-        self.save_hyperparameters()
-        
+
+        self.automatic_optimization = False  # Disable automatic optimizatio
         self.num_visible = num_visible
         self.num_hidden = num_hidden
         self.lr = learning_rate
-        self.weight_decay = weight_penalty
+        self.weight_decay = weight_decay
         self.momentum = momentum
         self.dynamic_lr = dynamic_lr
         self.final_momentum = final_momentum
+        self.batch_size = batch_size
 
-        # Weights and biases
-        self.W = nn.Parameter(torch.randn(num_visible, num_hidden) / math.sqrt(num_visible))
-        self.hid_bias = nn.Parameter(torch.zeros(num_hidden))
-        self.vis_bias = nn.Parameter(torch.zeros(num_visible))
+        # Initialize weights and biases
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.W = nn.Parameter(torch.randn(num_visible, num_hidden, device=device) / math.sqrt(num_visible))
+        self.hid_bias = nn.Parameter(torch.zeros(num_hidden, device=device))
+        self.vis_bias = nn.Parameter(torch.zeros(num_visible, device=device))
 
-        # Gradients momentum
-        self.register_buffer('W_momentum', torch.zeros_like(self.W))
-        self.register_buffer('hid_bias_momentum', torch.zeros_like(self.hid_bias))
-        self.register_buffer('vis_bias_momentum', torch.zeros_like(self.vis_bias))
+        # Momentum buffers (not Parameters)
+        self.W_momentum = torch.zeros_like(self.W)
+        self.hid_bias_momentum = torch.zeros_like(self.hid_bias)
+        self.vis_bias_momentum = torch.zeros_like(self.vis_bias)
 
     def forward(self, v):
-        return sigmoid(torch.matmul(v, self.W) + self.hid_bias)
+        """ Compute probabilities of hidden units given visible units. """
+        return torch.sigmoid(torch.matmul(v, self.W) + self.hid_bias)
 
     def backward(self, h):
-        return sigmoid(torch.matmul(h, self.W.T) + self.vis_bias)
+        """ Compute probabilities of visible units given hidden units. """
+        return torch.sigmoid(torch.matmul(h, self.W.T) + self.vis_bias)
 
-    def training_step(self, batch, batch_idx):
-        batch_data = batch
-        batch_size = batch_data.size(0)
-        CD = 1  # You might want to make this configurable
+    def train_epoch(self, data, epoch, CD=1):
+        """
+        Performs training for one epoch.
+        `data` should have shape (batch_size, num_visible).
+        """
+        total_loss = 0.0
+        lr = self.lr / (1 + 0.01 * epoch) if self.dynamic_lr else self.lr
+        batch_size = data.size(0)
+        momentum = self.momentum if epoch <= 5 else self.final_momentum
+        batch_data = data
+     # Shape: (num_visible,)
+        with torch.no_grad():
+            # Positive phase
+            pos_hid_probs = self.forward(batch_data)
+            pos_hid_states = (pos_hid_probs > torch.rand_like(pos_hid_probs)).float()
+            pos_assoc = torch.matmul(batch_data.T,pos_hid_probs)  # Fix shape
 
-        # Positive phase
-        pos_hid_probs = self(batch_data)
-        pos_hid_states = (pos_hid_probs > torch.rand_like(pos_hid_probs)).float()
-        pos_assoc = torch.matmul(batch_data.T, pos_hid_probs)
+            # Negative phase (Gibbs sampling)
+            neg_data = batch_data.clone()
+            for _ in range(CD):
+                neg_vis_probs = self.backward(pos_hid_states)
+                neg_data = (neg_vis_probs > torch.rand_like(neg_vis_probs)).float()
+                neg_hid_probs = self.forward(neg_data)
+                pos_hid_states = (neg_hid_probs > torch.rand_like(neg_hid_probs)).float()
+                neg_assoc = torch.matmul(neg_data.T, neg_hid_probs)  # Fix shape
 
-        # Negative phase
-        neg_data = batch_data
-        for _ in range(CD):
-            neg_vis_probs = self.backward(pos_hid_states)
-            neg_data = (neg_vis_probs > torch.rand_like(neg_vis_probs)).float()
-            neg_hid_probs = self(neg_data)
-            pos_hid_states = (neg_hid_probs > torch.rand_like(neg_hid_probs)).float()
-        neg_assoc = torch.matmul(neg_data.T, neg_hid_probs)
+            # Weight and bias updates
+            self.W_momentum.mul_(momentum).add_(lr * ((pos_assoc - neg_assoc) / batch_size - self.weight_decay * self.W))
+            self.hid_bias_momentum.mul_(momentum).add_(lr * (pos_hid_probs.sum(0) - neg_hid_probs.sum(0)) / batch_size)
+            self.vis_bias_momentum.mul_(momentum).add_(lr * (batch_data.sum(0) - neg_data.sum(0)) / batch_size)
 
-        # Compute gradients
-        W_grad = (pos_assoc - neg_assoc) / batch_size - self.weight_decay * self.W
-        hid_bias_grad = (pos_hid_probs.sum(0) - neg_hid_probs.sum(0)) / batch_size
-        vis_bias_grad = (batch_data.sum(0) - neg_data.sum(0)) / batch_size
+            self.W.add_(self.W_momentum)
+            self.hid_bias.add_(self.hid_bias_momentum)
+            self.vis_bias.add_(self.vis_bias_momentum)
 
-        # Update parameters
-        self.W_momentum = self.W_momentum * self.momentum + W_grad
-        self.hid_bias_momentum = self.hid_bias_momentum * self.momentum + hid_bias_grad
-        self.vis_bias_momentum = self.vis_bias_momentum * self.momentum + vis_bias_grad
+            batch_loss = torch.sum((batch_data - neg_vis_probs) ** 2) / batch_size
+            total_loss += batch_loss.item()
 
-        self.W.add_(self.W_momentum)
-        self.hid_bias.add_(self.hid_bias_momentum)
-        self.vis_bias.add_(self.vis_bias_momentum)
+            torch.cuda.empty_cache()
 
-        # Compute loss
-        loss = torch.sum((batch_data - neg_vis_probs) ** 2) / batch_size
-        self.log('train_loss', loss)
-        return loss
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.SGD(self.parameters(), lr=self.lr)
-        if self.dynamic_lr:
-            scheduler = torch.optim.lr_scheduler.LambdaLR(
-                optimizer, lr_lambda=lambda epoch: 1 / (1 + 0.01 * epoch)
-            )
-            return [optimizer], [scheduler]
-        return optimizer
-
-    def on_train_epoch_start(self):
-        if self.current_epoch > 5:
-            self.momentum = self.final_momentum
-
+       
+        return total_loss / batch_size
 # Iterative DBN class
 class iDBN(pl.LightningModule):
-    def __init__(self, params, layer_sizes=[500, 500]):
+    def __init__(self, params, layer_sizes=[500, 500],batch_size = 10):
         super(iDBN, self).__init__()
-        self.save_hyperparameters()
-        
+        self.save_hyperparameters()  # Save params for easy access
+
+
+        self.automatic_optimization = False  # Disable automatic optimizatio
+        self.params = params
+        self.layer_sizes = layer_sizes
         self.layers = nn.ModuleList()
+        self.batch_size = batch_size 
+
         for i in range(len(layer_sizes) - 1):
             self.layers.append(RBM(
-                num_visible=layer_sizes[i], 
-                num_hidden=layer_sizes[i + 1], 
+                num_visible=layer_sizes[i],
+                num_hidden=layer_sizes[i + 1],
                 learning_rate=params['LEARNING_RATE'],
-                weight_penalty=params['WEIGHT_PENALTY'],
+                weight_decay=params['WEIGHT_PENALTY'],
                 momentum=params['INIT_MOMENTUM'],
                 dynamic_lr=params['LEARNING_RATE_DYNAMIC'],
-                final_momentum=params['FINAL_MOMENTUM']
+                final_momentum=params['FINAL_MOMENTUM'],
+                batch_size = self.batch_size
             ))
+
+        self.current_layer = 0  # Track which layer is being trained
+        self.epochs_per_layer = 5  # Number of epochs to train each layer
 
     def forward(self, x):
         for rbm in self.layers:
@@ -121,27 +127,21 @@ class iDBN(pl.LightningModule):
         return x
 
     def training_step(self, batch, batch_idx):
-        for layer,rbm in enumerate(self.layers):
-            rbm.train()
-            rbm.training_step(batch, batch_idx)
-        
-        x, _ = batch  # Assuming the batch contains both data and labels
-        loss = 0
-        temp_data = x.clone()
-        
+        x, _ = batch  # Assuming batch contains (data, labels)
+        x = x.to(self.device)
+        temp_data = x.clone() 
         for rbm_layer in self.layers:
-            rbm_loss = rbm_layer.training_step({'batch': temp_data}, batch_idx)
-            loss += rbm_loss
-            temp_data = rbm_layer(temp_data)
+            layer_loss = 0
+            layer_loss = rbm_layer.train_epoch(temp_data, self.current_epoch)
+            #self.log(f'layer_{self.current_layer}_loss', layer_loss, on_step=True, on_epoch=True, prog_bar=True)
+            temp_data = rbm_layer.forward(temp_data)
 
-        self.log('train_loss', loss)
-        return loss
+        return torch.tensor(layer_loss)
 
-    
 
-    def on_train_epoch_end(self):
-        for rbm in self.layers:
-            rbm.on_train_epoch_end()# **Multimodal iDBN in PyTorch Lightning**
+    def configure_optimizers(self):
+        """No optimizer needed for RBMs (manual weight updates)."""
+        return None
 
 class iMDBN(pl.LightningModule):
     def __init__(self, layer_sizes_img, layer_sizes_txt, joint_layer_size, learning_rate=0.001):

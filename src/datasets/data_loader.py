@@ -2,6 +2,7 @@ import pytorch_lightning as pl
 import torch
 from torch.utils.data import Dataset, DataLoader
 from scipy import io
+import h5py
 import numpy as np
 from sklearn.model_selection import train_test_split
 import torch.nn.functional as F
@@ -26,7 +27,13 @@ class NumerosityDataModule(pl.LightningDataModule):
 
     def setup(self, stage=None):
         # Load MATLAB data
-        matlab_data = io.loadmat(self.data_path)
+        try:
+            matlab_data = io.loadmat(self.data_path)
+        except:
+            with h5py.File(self.data_path, 'r') as f:
+            # Assuming the dataset name is 'data', update if necessary
+            matlab_data = 
+            {key: f[key][:] for key in f.keys()}
         D = matlab_data['D']  # Images data
         N_list = matlab_data['N_list'].flatten()  # Numerosity list
 
@@ -47,10 +54,14 @@ class NumerosityDataModule(pl.LightningDataModule):
         self.train_labels_one_hot = F.one_hot(self.train_labels.long() - 1, num_classes=int(np.max(N_list_train))).float()
         self.test_labels_one_hot = F.one_hot(self.test_labels.long() - 1, num_classes=int(np.max(N_list_test))).float()
 
+        # store dimensionality informations
+        self.data_shape = self.train_data.shape[2]
 
         # Create datasets
         self.train_dataset = NumerosityDataset(self.train_data, self.train_labels_one_hot)
         self.test_dataset = NumerosityDataset(self.test_data, self.test_labels_one_hot)
+
+        
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
