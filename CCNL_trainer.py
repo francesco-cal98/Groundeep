@@ -1,13 +1,15 @@
 from gdbn_model import gDBN, iDBN
 import torch
 import pickle
-from src.datasets.zipfian_dataset import create_dataloaders
+from src.datasets.zipfian_dataset import create_dataloaders_zipfian
+from src.datasets.uniform_dataset import create_dataloaders_uniform
+
 
 
 def main():
     # Parameters to match MATLAB implementation
     params = {
-        "ALGORITHM": "g",
+        "ALGORITHM": "i",
         "LEARNING_RATE": 0.015,
         "WEIGHT_PENALTY": 0.0001,
         "INIT_MOMENTUM": 0.7,
@@ -25,17 +27,15 @@ def main():
          [1500, 500], [1500, 1000], [1500, 1500], [1500, 2000]
      ]
  
-
+    """
+    
     layer_sizes_list = [
          [500, 500], [500, 1000], [500, 1500], [500, 2000], 
-         [1000, 500], [1000, 1000], [1000, 1500], [1000, 2000], 
-         [1500, 500], [1500, 1000], [1500, 1500], [1500, 2000]
-     ]
+         [1000, 500],[1000, 1000], [1000, 1500], [1000, 2000], 
+         [1500, 500], [1500, 1000], [1500, 1500], [1500, 2000]]
     
-    """
-    layer_sizes_list = [
-        [1000, 500]
-    ]
+    
+
     
     # Load preprocessed training dataset
     with open(params["TRAINING_FILE_PATH"], 'rb') as f:
@@ -50,7 +50,8 @@ def main():
     #train_loader = data_module.train_dataloader()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train_loader, val_loader, test_loader = create_dataloaders("/home/student/Desktop/Groundeep/training_tensors", batch_size = 128, num_workers = 1)
+    #train_loader_zipfian, val_loader_zipfian, test_loader_zipfian = create_dataloaders_zipfian("/home/student/Desktop/Groundeep/training_tensors", batch_size = 128, num_workers = 1)
+    train_loader_uniform, val_loader_uniform, test_loader_uniform = create_dataloaders_uniform("/home/student/Desktop/Groundeep/training_tensors/uniform","NumStim_1to40_200x200_TR_uniform.npz", batch_size = 128, num_workers = 1)
 
     #Train and save DBN for each configuration
     for layer_sizes in layer_sizes_list:
@@ -59,12 +60,12 @@ def main():
         
         if params["ALGORITHM"]=="g":
             save_path = f"{params['SAVE_PATH']}_g{params['SAVE_NAME']}_{layer_name}.pkl"
-            gdbn = gDBN([10000] +layer_sizes, params,train_loader,device)                 
-            gdbn.train(train_data, epochs=params["EPOCHS"])
+            gdbn = gDBN([40000] +layer_sizes, params,train_loader_uniform,device)                 
+            gdbn.train(epochs=params["EPOCHS"])
             gdbn.save(save_path)
         elif params["ALGORITHM"]=="i":
             save_path = f"{params['SAVE_PATH']}_i{params['SAVE_NAME']}_{layer_name}.pkl"
-            idbn = iDBN([10000] +layer_sizes, params,train_loader,device)
+            idbn = iDBN([40000] +layer_sizes, params,train_loader_uniform,device)
             idbn.train(epochs=params["EPOCHS"])
             idbn.save(save_path)
     

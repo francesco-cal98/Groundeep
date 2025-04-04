@@ -52,7 +52,7 @@ class ZipfianDataset(Dataset):
         return sample, self.sample_labels_onehot[idx]
 
 
-def create_dataloaders(directory, batch_size=32, subsample_fraction=None, num_workers=4, random_state=42):
+def create_dataloaders_zipfian(directory, batch_size=32, subsample_fraction=None, num_workers=4, random_state=42):
     dataset = ZipfianDataset(directory)
     total_samples = len(dataset)
     indices = np.arange(total_samples)
@@ -70,7 +70,7 @@ def create_dataloaders(directory, batch_size=32, subsample_fraction=None, num_wo
         indices, labels, test_size=0.02, stratify=labels, random_state=random_state
     )
     val_idx, test_idx = train_test_split(
-        temp_idx, test_size=0.5, stratify=temp_labels, random_state=random_state
+        temp_idx, test_size=0.1, stratify=temp_labels, random_state=random_state
     )
 
     train_dataset = Subset(dataset, train_idx)

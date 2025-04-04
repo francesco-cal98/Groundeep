@@ -108,43 +108,48 @@ class gDBN:
             )
             self.layers.append(rbm)
 
-    def train(self, data, epochs):
-        writer = SummaryWriter(log_dir=self.log_dir)  # Use dynamic log dir
-        all_epoch_losses = {}  # Dictionary to store losses per layer
+    def train(self, epochs):
+        writer = SummaryWriter(log_dir=self.log_dir)
+        all_epoch_losses = {}
 
-        # Select 5 random images to log reconstruction
-        sample_images, _ = next(iter(self.dataloader))  # Get first batch
-        sample_images = sample_images[:5].to(self.device)  # Take first 5 images
+        # Select sample images for logging
+        sample_images, _ = next(iter(self.dataloader))
+        sample_images = sample_images[:5].to(self.device)
 
         for layer_idx, rbm in enumerate(self.layers):
-            layer_name = f"RBM_Layer_{layer_idx + 1}"  # Naming each layer
+            layer_name = f"RBM_Layer_{layer_idx + 1}"
             print(f'Training {layer_name}')
-            epoch_losses = []  # Store losses for the current layer
+            epoch_losses = []
 
-            for epoch in range(epochs):
+            for epoch in tqdm(range(epochs), desc=f"Training {layer_name}"):
                 total_loss = 0
                 num_batches = 0
 
                 for batch in self.dataloader:
                     train_data, _ = batch
-                    data = train_data.to(self.device)
-                    batch_loss = rbm.train_epoch(data, epoch, epochs, CD=1)
+                    train_data = train_data.to(self.device)
+
+                    # If this is NOT the first layer, pass through previous RBMs
+                    if layer_idx > 0:
+                        with torch.no_grad():  # Prevent gradient tracking
+                            for prev_rbm in self.layers[:layer_idx]:  
+                                train_data = prev_rbm.forward(train_data)
+
+                    # Train the current RBM
+                    batch_loss = rbm.train_epoch(train_data, epoch, epochs, CD=1)
                     total_loss += batch_loss
                     num_batches += 1
+
                     torch.cuda.empty_cache()
 
-                # Compute average loss for this epoch
                 avg_epoch_loss = total_loss / num_batches
                 epoch_losses.append(avg_epoch_loss)
-
-                # Log loss to TensorBoard
                 writer.add_scalar(f"Loss/{layer_name}", avg_epoch_loss, epoch)
 
-            all_epoch_losses[layer_name] = epoch_losses  # Store in dictionary
-            data = rbm.forward(train_data)
+            all_epoch_losses[layer_name] = epoch_losses
 
-        writer.close()  # Close the TensorBoard writer
-        return all_epoch_losses  # Return dictionary with layer-wise losses
+        writer.close()
+        return all_epoch_losses
 
 
     def save(self, path):
