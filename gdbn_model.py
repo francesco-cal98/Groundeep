@@ -6,7 +6,7 @@ from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 import random
 import os
-
+from datetime import datetime
 
 
 
@@ -161,13 +161,20 @@ class gDBN:
 
 # iDBN Class
 class iDBN:
-    def __init__(self, layer_sizes, params,dataloader,device,log_dir= "logs-idbn"):
+    def __init__(self, layer_sizes, params, dataloader, device, log_dir="logs-idbn"):
         self.layers = []
         self.params = params
         self.dataloader = dataloader
         self.device = device
-        self.writer = SummaryWriter(log_dir)
 
+        # === Build architecture string from layer sizes ===
+        arch_str = '-'.join(str(size) for size in layer_sizes)
+
+        # === Create unique log directory with architecture and timestamp ===
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_name = f"run_{arch_str}_{timestamp}"
+        full_log_dir = os.path.join(log_dir, run_name)
+        self.writer = SummaryWriter(full_log_dir)
 
         for i in range(len(layer_sizes) - 1):
             rbm = RBM(
@@ -180,7 +187,6 @@ class iDBN:
                 final_momentum=params["FINAL_MOMENTUM"]
             )
             self.layers.append(rbm)
-
 
     def train(self, epochs):
             epoch_losses = []

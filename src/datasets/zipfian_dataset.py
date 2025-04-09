@@ -84,16 +84,6 @@ def create_dataloaders_zipfian(directory, batch_size=32, subsample_fraction=None
     return train_loader, val_loader, test_loader
 
 
-
-
-
-
-
-
-
-
-
-
 """
 from pathlib import Path
 import torch

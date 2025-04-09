@@ -26,14 +26,14 @@ class UniformDataset(Dataset):
 
         data = np.load(data_name)
 
-        self.data = data['D'].T
+        self.data = data['D']
         self.labels = data['N_list']
 
     def __len__(self):
         return len(self.data)
     
     def __getitem__(self, idx):
-        data = torch.tensor(self.data[idx]) / 255
+        data = (torch.tensor(self.data[idx])) / 255 # normalize the images 
         labels = torch.tensor(self.data[idx])
         return data, labels
 
