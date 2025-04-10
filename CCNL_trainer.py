@@ -36,7 +36,6 @@ def main():
     
     
 
-    
     # Load preprocessed training dataset
     with open(params["TRAINING_FILE_PATH"], 'rb') as f:
         train_dataset = pickle.load(f)

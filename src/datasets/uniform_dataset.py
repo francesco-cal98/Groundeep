@@ -34,7 +34,7 @@ class UniformDataset(Dataset):
     
     def __getitem__(self, idx):
         data = (torch.tensor(self.data[idx])) / 255 # normalize the images 
-        labels = torch.tensor(self.data[idx])
+        labels = torch.tensor(self.labels[idx])
         return data, labels
 
 
