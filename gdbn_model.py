@@ -91,10 +91,18 @@ class gDBN:
         self.params = params
         self.dataloader = dataloader
         self.device = device
+        self.log_dir = log_dir
 
-        # Generate a unique log directory based on layer sizes
-        layer_sizes_str = "-".join(map(str, layer_sizes))
-        self.log_dir = os.path.join(log_dir, f"gDBN_{layer_sizes_str}")
+        # === Build architecture string from layer sizes ===
+        arch_str = '-'.join(str(size) for size in layer_sizes)
+
+        # === Create unique log directory with architecture and timestamp ===
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        run_name = f"run_{arch_str}_{timestamp}"
+        full_log_dir = os.path.join(self.log_dir, run_name)
+        self.writer = SummaryWriter(full_log_dir)
+
+
 
         for i in range(len(layer_sizes) - 1):
             rbm = RBM(

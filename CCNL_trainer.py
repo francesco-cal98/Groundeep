@@ -9,7 +9,7 @@ from src.datasets.uniform_dataset import create_dataloaders_uniform
 def main():
     # Parameters to match MATLAB implementation
     params = {
-        "ALGORITHM": "i",
+        "ALGORITHM": "g",
         "LEARNING_RATE": 0.015,
         "WEIGHT_PENALTY": 0.0001,
         "INIT_MOMENTUM": 0.7,
@@ -21,20 +21,17 @@ def main():
          "SAVE_NAME": "dbn_trained_uniform" #i or g is added on start depending on algorithm
     }
         # List of layer sizes to test
-    """
-        layer_sizes_list = [
-         [1000, 1000], [1000, 1500], [1000, 2000], 
-         [1500, 500], [1500, 1000], [1500, 1500], [1500, 2000]
-     ]
-    """
     
     layer_sizes_list = [
          [500, 500], [500, 1000], [500, 1500], [500, 2000], 
          [1000, 500],[1000, 1000], [1000, 1500], [1000, 2000], 
          [1500, 500], [1500, 1000], [1500, 1500], [1500, 2000]
-         ]
+        ]
     
     
+
+    
+    #layer_sizes_list = [[1500,1500]]
 
     # Load preprocessed training dataset
     with open(params["TRAINING_FILE_PATH"], 'rb') as f:
@@ -59,7 +56,7 @@ def main():
         
         if params["ALGORITHM"]=="g":
             save_path = f"{params['SAVE_PATH']}_g{params['SAVE_NAME']}_{layer_name}.pkl"
-            gdbn = gDBN([10000] +layer_sizes, params,train_loader,device)                 
+            gdbn = gDBN([10000] +layer_sizes, params,train_loader,device,log_dir = "logs-gdbn/uniform")                 
             gdbn.train(epochs=params["EPOCHS"])
             gdbn.save(save_path)
         elif params["ALGORITHM"]=="i":

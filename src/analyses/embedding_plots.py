@@ -45,19 +45,27 @@ pkl_files = glob(os.path.join(network_dir, "*.pkl"))
 image_paths = []
 
 for pkl_path in pkl_files:
-    print(f"Processing network architecture: {os.path.basename(pkl_path)}")
     arch_name = os.path.splitext(os.path.basename(pkl_path))[0]
+    img_path = os.path.join(output_dir, f"{arch_name}.jpg")
+
+    # Skip if already processed
+    if os.path.exists(img_path):
+        print(f"Skipping {arch_name} — already processed.")
+        image_paths.append(img_path)
+        continue
+
+    print(f"Processing network architecture: {arch_name}")
     
     analyser = Embedding_analysis(data_path, data_file, pkl_path)
     embeddings, labels = analyser._get_encodings()
     embeddings = np.array(embeddings, dtype=np.float64)
-    
+
     mds = MDS(n_components=2, max_iter=100, n_jobs=1, dissimilarity='euclidean', random_state=42)
     emb = mds.fit_transform(embeddings)
 
-    img_path = os.path.join(output_dir, f"{arch_name}.jpg")
     plot_embeddings(emb, labels, title=arch_name, save_path=img_path)
     image_paths.append(img_path)
+
 
 print(f"Generated {len(image_paths)} individual plots. Now creating the final combined plot...")
 

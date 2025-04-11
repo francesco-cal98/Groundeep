@@ -184,6 +184,8 @@ def beta_extraction(choice, idxs, N_list, TSA_list, FA_list, guessRate=0.01):
     isaRight = []
     faLeft = []
     faRight = []
+    filtered_choices = []
+
 
     # Flatten input arrays and extract pairs of indices
     N_list = np.squeeze(N_list)
@@ -195,9 +197,31 @@ def beta_extraction(choice, idxs, N_list, TSA_list, FA_list, guessRate=0.01):
     # print('--- Input Debugging ---')
     # print(f'Number of trials: {len(choice)}')
     # print(f'Choice vector: {np.sum(choice == 0)} left, {np.sum(choice == 1)} right')
+# Step 1: Create a boolean mask and get valid indices
+    mask = [n <= 14 for n in N_list]          # or: mask = np.array(N_list) > 14
+    valid_indices = set(i for i, valid in enumerate(mask) if valid)
+
+    # Step 2: Subset lists based on this condition
+    numLeft, numRight = [], []
+    isaLeft, isaRight = [], []
+    faLeft, faRight = [], []
+
+    for i, idx_pair in enumerate(idxs_flat):
+        idx_left, idx_right = int(idx_pair[0]), int(idx_pair[1])
+
+        # Only keep the pair if both indices pass the N_list filter
+        if idx_left in valid_indices and idx_right in valid_indices:
+            numLeft.append(N_list[idx_left])
+            numRight.append(N_list[idx_right])
+            isaLeft.append(TSA_list[idx_left] / N_list[idx_left])
+            isaRight.append(TSA_list[idx_right] / N_list[idx_right])
+            faLeft.append(FA_list[idx_left])
+            faRight.append(FA_list[idx_right])
+            filtered_choices.append(choice[i])
 
     # Populate lists for left and right parameters based on indices
-    for idx_pair in idxs_flat:
+    """
+        for idx_pair in idxs_flat:
         idx_left, idx_right = int(idx_pair[0]), int(idx_pair[1])
 
         numLeft.append(N_list[idx_left])
@@ -207,9 +231,11 @@ def beta_extraction(choice, idxs, N_list, TSA_list, FA_list, guessRate=0.01):
         faLeft.append(FA_list[idx_left])
         faRight.append(FA_list[idx_right])
 
+    """
+
     # Call the main model function to fit and calculate Weber fraction
     model_fit, weber, prob_choice_right, X = num_size_spacing_model(
-        choice, np.array(numLeft), np.array(numRight), np.array(isaLeft),
+        filtered_choices, np.array(numLeft), np.array(numRight), np.array(isaLeft),
         np.array(isaRight), np.array(faLeft), np.array(faRight), guessRate
     )
 

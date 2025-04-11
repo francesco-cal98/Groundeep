@@ -25,15 +25,16 @@ def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Paths
-    path_to_dbn_dir = "/home/student/Desktop/Groundeep/networks/uniform"
+    path_to_dbn_dir = "/home/student/Desktop/Groundeep/networks/uniform/idbn"
     path_to_train_dataset = "/home/student/Desktop/Groundeep/pairs_from_mat_train.pkl"
     path_to_test_dataset = "/home/student/Desktop/Groundeep/pairs_from_mat_test.pkl"
     test_file = "/home/student/Desktop/Groundeep/NumStim_7to28_100x100_TE.mat"
-    output_file = "model_coefficients_results_all_uniform.xlsx"
+    output_file = "model_coefficients_results_all_uniform_subset_small_numbers.xlsx"
 
     # Load datasets
     train_dataset = pickle.load(open(path_to_train_dataset, 'rb'))
     XtrainComp, YtrainComp, idxs_train = train_dataset['data'].to(DEVICE), train_dataset['labels'].to(DEVICE), train_dataset['idxs'].to(DEVICE)
+    
 
     test_dataset = pickle.load(open(path_to_test_dataset, 'rb'))
     XtestComp, YtestComp, idxs_test = test_dataset['data'].to(DEVICE), test_dataset['labels'].to(DEVICE), test_dataset['idxs'].to(DEVICE)
@@ -43,6 +44,8 @@ def main():
     N_list_test = test_contents['N_list']
     TSA_list_test = test_contents['TSA_list']
     FA_list_test = test_contents['FA_list']
+
+    small_sizes_flag = True
 
     results = []
 
