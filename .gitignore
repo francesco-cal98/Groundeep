@@ -19,5 +19,6 @@ logs/
 lightning_logs/
 .vscode/
 .*pt
+.*png
 logs-gdbn/
 src/notebooks/model_coefficients_results_5.xlsx

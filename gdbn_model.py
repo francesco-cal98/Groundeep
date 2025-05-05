@@ -102,8 +102,6 @@ class gDBN:
         full_log_dir = os.path.join(self.log_dir, run_name)
         self.writer = SummaryWriter(full_log_dir)
 
-
-
         for i in range(len(layer_sizes) - 1):
             rbm = RBM(
                 num_visible=layer_sizes[i],
@@ -200,12 +198,12 @@ class iDBN:
             epoch_losses = []
 
             # Select 5 random images to log reconstruction
-            sample_images, _ = next(iter(self.dataloader))  # Get first batch
+            sample_images,_ = next(iter(self.dataloader))  # Get first batch
             sample_images = sample_images[:5].to(self.device)  # Take first 5 images
 
             for epoch in tqdm(range(epochs)):
                 for batch in self.dataloader:
-                    train_data, one_hot = batch 
+                    train_data,labels = batch 
                     temp_data = train_data.to(self.device)
                     # Train the current RBM layer
                     for i, rbm_layer in enumerate(self.layers):
@@ -217,7 +215,7 @@ class iDBN:
                         # Generate output for the next layer
                         temp_data = rbm_layer.forward(temp_data)
                         #print(f"After Layer {i}: temp_data shape = {temp_data.shape}")
-                    epoch_losses.append(batch_loss)
+                        epoch_losses.append(batch_loss)
 
                 mean_loss = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0  # Compute mean loss
 

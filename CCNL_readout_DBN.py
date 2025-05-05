@@ -210,7 +210,7 @@ def beta_extraction(choice, idxs, N_list, TSA_list, FA_list, guessRate=0.01):
         idx_left, idx_right = int(idx_pair[0]), int(idx_pair[1])
 
         # Only keep the pair if both indices pass the N_list filter
-        if idx_left in valid_indices and idx_right in valid_indices:
+        if idx_left in idxs_flat and idx_right in idxs_flat:
             numLeft.append(N_list[idx_left])
             numRight.append(N_list[idx_right])
             isaLeft.append(TSA_list[idx_left] / N_list[idx_left])
