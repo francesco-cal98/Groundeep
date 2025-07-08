@@ -25,21 +25,25 @@ def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Paths
-    path_to_dbn_dir = "/home/student/Desktop/Groundeep/networks/uniform/idbn"
+    path_to_dbn_dir = "/home/student/Desktop/Groundeep/networks/zipfian/idbn_new_dataset/"
     path_to_train_dataset = "/home/student/Desktop/Groundeep/pairs_from_mat_train.pkl"
     path_to_test_dataset = "/home/student/Desktop/Groundeep/pairs_from_mat_test.pkl"
     test_file = "/home/student/Desktop/Groundeep/NumStim_7to28_100x100_TE.mat"
-    output_folder = "/home/student/Desktop/Groundeep/outputs/results_excel"
-    output_file = "model_coefficients_results_all_uniform.xlsx"
+    output_folder = "/home/student/Desktop/Groundeep/outputs/results_excel_new_dataset"
+    output_file = "model_coefficients_results_all_zipfian.xlsx"
+    os.makedirs(output_folder, exist_ok=True)
+
 
     # Load datasets
-    train_dataset = pickle.load(open(path_to_train_dataset, 'rb'))
-    XtrainComp, YtrainComp, idxs_train = train_dataset['data'].to(DEVICE), train_dataset['labels'].to(DEVICE), train_dataset['idxs'].to(DEVICE)
-    
+    train_dataset = pickle.load(open(path_to_train_dataset, 'rb'))  
+
+    XtrainComp, YtrainComp, idxs_train = torch.tensor(train_dataset['data']).to(DEVICE), torch.tensor(train_dataset['labels']).to(DEVICE), torch.tensor(train_dataset['idxs']).to(DEVICE)
+    XtrainComp = XtrainComp
 
     test_dataset = pickle.load(open(path_to_test_dataset, 'rb'))
-    XtestComp, YtestComp, idxs_test = test_dataset['data'].to(DEVICE), test_dataset['labels'].to(DEVICE), test_dataset['idxs'].to(DEVICE)
-
+    XtestComp, YtestComp, idxs_test = torch.tensor(test_dataset['data']).to(DEVICE), torch.tensor(test_dataset['labels']).to(DEVICE), torch.tensor(test_dataset['idxs']).to(DEVICE)
+    XtestComp = XtestComp
+    
     # Load test MAT data
     test_contents = io.loadmat(test_file)
     N_list_test = test_contents['N_list']

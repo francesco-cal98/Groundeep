@@ -105,7 +105,7 @@ with tqdm(total=tot_patterns, desc="Generating stimuli") as pbar:
                     np.random.seed(seed)
                     
                     # Generate display
-                    currDisp = np.zeros((disp_x, disp_y), dtype=np.uint8)
+                    currDisp = np.zeros((disp_x, disp_y), dtype=np.float32)
                     count = 0
                     item_positions = []
                     
@@ -144,6 +144,8 @@ with tqdm(total=tot_patterns, desc="Generating stimuli") as pbar:
                                 continue
                         
                         # Place item
+                        brightness = np.random.uniform(-0.5, 1.0)  # random brightness, avoid very dark dots
+
                         cv2.circle(currDisp, (pos_x, pos_y), r, (255,), thickness=-1, lineType=cv2.LINE_AA)
                         item_positions.append([pos_x, pos_y])
                         count += 1
@@ -153,7 +155,8 @@ with tqdm(total=tot_patterns, desc="Generating stimuli") as pbar:
                         curr_hash = hashlib.md5(currDisp.tobytes()).hexdigest()
                         if curr_hash not in combo_hashes:
                             combo_hashes.add(curr_hash)
-
+                            # ✅ Add this conversion here:
+                            #currDisp = (np.clip(currDisp, 0, 1) * 255).astype(np.uint8)
                             # Store data
                             D_list.append(currDisp.flatten(order='F'))
                             N_list.append(n)
@@ -163,7 +166,7 @@ with tqdm(total=tot_patterns, desc="Generating stimuli") as pbar:
                             CH_list.append(np.sum(convex_hull_image(currDisp)))
                             generated += 1
                             index += 1
-                            
+                             
                     attempts += 1
                     if attempts%1000 == 0 and attempts > 0:
                         print(f"Retrying patterns for n={n}, Sz={Sz:.1e}, Sp={Sp:.1e} {attempts}/{max_tries}")

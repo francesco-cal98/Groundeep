@@ -2,12 +2,14 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
-from matplotlib.cm import get_cmap
-from PIL import Image
+from sklearn.manifold import MDS
 from glob import glob
 import sys
+import pandas as pd
+import seaborn as sns
+from scipy.stats import spearmanr
 
-# Impostazioni dei percorsi
+# Path setup
 current_dir = os.getcwd()
 project_root = os.path.abspath(os.path.join(current_dir, '..', '..'))
 sys.path.append(project_root)
@@ -15,85 +17,201 @@ sys.path.append(current_dir)
 
 from src.analyses.embedding_analysis import Embedding_analysis
 
-# Percorsi
-data_path = "/home/student/Desktop/Groundeep/training_tensors/zipfian/"
-data_file = "NumStim_1to40_100x100_TR_zipfian.npz"
-network_dir = "/home/student/Desktop/Groundeep/networks/zipfian"
-output_dir = "/home/student/Desktop/Groundeep/outputs/images_zipfian/2D_pca"
-os.makedirs(output_dir, exist_ok=True)
 
-def plot_embeddings(emb, y, title="", colormap="viridis", save_path=None, xlim=None, ylim=None):
-    fig, ax = plt.subplots(figsize=(10, 5))
-    num_classes = len(np.unique(y))
-    cmap = get_cmap(colormap, num_classes)
-    norm = plt.Normalize(vmin=min(y), vmax=max(y))
-    sc = ax.scatter(emb[:, 0], emb[:, 1], c=y, cmap=cmap, norm=norm, s=40)
-    cbar = plt.colorbar(sc, ax=ax)
-    cbar.set_label("Class Index")
-    ax.set_title(title)
-    if xlim: ax.set_xlim(xlim)
-    if ylim: ax.set_ylim(ylim)
-    if save_path:
-        fig.savefig(save_path, dpi=300, bbox_inches='tight')
+def plot_feature_correlation_matrix(features_dict, save_path, title="Feature Correlation Matrix"):
+    df = pd.DataFrame(features_dict)
+    corr_matrix = df.corr()
+
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(corr_matrix, annot=True, fmt=".2f", cmap="coolwarm", square=True, cbar=True)
+    plt.title(title)
+    plt.tight_layout()
+    
+    plt.savefig(save_path, dpi=300)
+    plt.close()
+
+
+def plot_2d_embedding_and_correlations(emb_2d, features_dict, arch_name, save_path, method_name="2D Embedding"):
+    fig, axs = plt.subplots(4, 3, figsize=(18, 16))
+    axs = axs.flatten()
+
+    numerosity = features_dict["N_list"]
+    sc = axs[0].scatter(emb_2d[:, 0], emb_2d[:, 1], c=numerosity, cmap="viridis", s=40)
+    axs[0].set_title(f"{method_name} – colored by Numerosity")
+    axs[0].set_xlabel("Dim 1")
+    axs[0].set_ylabel("Dim 2")
+    plt.colorbar(sc, ax=axs[0], label="Numerosity")
+
+    plot_idx = 1
+    correlations = {}
+    for feat_name, feat_values in features_dict.items():
+        for i, dim_label in enumerate(["Dim 1", "Dim 2"]):
+            dim = emb_2d[:, i]
+            corr, _ = spearmanr(dim, feat_values)
+            correlations[(feat_name, dim_label)] = corr
+            axs[plot_idx].scatter(dim, feat_values, alpha=0.6)
+            axs[plot_idx].set_title(f"{feat_name} vs {dim_label} (r = {corr:.2f})")
+            axs[plot_idx].set_xlabel(dim_label)
+            axs[plot_idx].set_ylabel(feat_name)
+            plot_idx += 1
+
+    for j in range(plot_idx, len(axs)):
+        fig.delaxes(axs[j])
+
+    fig.suptitle(f"{method_name} + Feature Correlations – {arch_name}", fontsize=18)
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(save_path, dpi=300)
     plt.close(fig)
 
-# Step 1: Esegui PCA per ogni rete e memorizza i limiti
-pkl_files = glob(os.path.join(network_dir, "*.pkl"))
-embeddings_data = []
-x_lims, y_lims = [], []
+    return correlations
 
-for pkl_path in pkl_files:
-    arch_name = os.path.splitext(os.path.basename(pkl_path))[0]
-    analyser = Embedding_analysis(data_path, data_file, pkl_path)
-    embeddings, labels = analyser._get_encodings()
-    embeddings = np.array(embeddings, dtype=np.float64)
 
-    # PCA per rete
-    pca = PCA(n_components=2)
-    emb_2d = pca.fit_transform(embeddings)
+def plot_all_pcs_vs_numerosity(embeddings, numerosities, arch_name, save_path, variance_threshold=0.01, max_components=20):
+    pca = PCA(n_components=max_components)
+    pcs = pca.fit_transform(embeddings)
+    explained_variance = pca.explained_variance_ratio_
 
-    # Memorizza i limiti per ogni rete
-    x_lims.append((emb_2d[:, 0].min(), emb_2d[:, 0].max()))
-    y_lims.append((emb_2d[:, 1].min(), emb_2d[:, 1].max()))
+    num_components = np.sum(explained_variance >= variance_threshold)
+    if num_components == 0:
+        num_components = 1
 
-    embeddings_data.append((arch_name, emb_2d, labels))
+    cols = 4
+    rows = int(np.ceil(num_components / cols))
+    fig, axs = plt.subplots(rows, cols, figsize=(5 * cols, 4 * rows), sharex=True)
+    axs = axs.flatten()
 
-# Step 2: Calcola i limiti globali (minimo e massimo) per ogni asse
-x_min = min([lim[0] for lim in x_lims])
-x_max = max([lim[1] for lim in x_lims])
-y_min = min([lim[0] for lim in y_lims])
-y_max = max([lim[1] for lim in y_lims])
+    correlation_results = []
 
-# Step 3: Plot con limiti globali uguali per tutti
-image_paths = []
-for arch_name, emb_2d, labels in embeddings_data:
-    img_path = os.path.join(output_dir, f"{arch_name}.jpg")
-    plot_embeddings(emb_2d, labels, title=arch_name, save_path=img_path,
-                    xlim=(x_min, x_max), ylim=(y_min, y_max))
-    image_paths.append(img_path)
+    for i in range(num_components):
+        pc = pcs[:, i]
+        corr, _ = spearmanr(numerosities, pc)
 
-# Step 4: Crea il plot finale con tutte le immagini
-cols = 3
-rows = int(np.ceil(len(image_paths) / cols))
-fig, axes = plt.subplots(rows, cols, figsize=(cols * 6, rows * 4))
+        axs[i].scatter(numerosities, pc, alpha=0.5)
+        axs[i].set_title(f'PC{i+1} | ρ = {corr:.2f}, Var = {explained_variance[i]:.3f}')
+        axs[i].set_xlabel('Numerosity')
+        axs[i].set_ylabel(f'PC{i+1}')
+        axs[i].grid(True)
 
-for idx, img_path in enumerate(image_paths):
-    row, col = divmod(idx, cols)
-    ax = axes[row, col] if rows > 1 else axes[col]
-    img = Image.open(img_path)
-    ax.imshow(img)
-    ax.set_title(os.path.basename(img_path), fontsize=10)
-    ax.axis('off')
+        correlation_results.append({
+            'arch': arch_name,
+            'feature': 'N_list',
+            'PC': f'PC{i+1}',
+            'correlation': corr,
+            'explained_variance': explained_variance[i]
+        })
 
-# Nascondi gli assi inutilizzati
-for idx in range(len(image_paths), rows * cols):
-    row, col = divmod(idx, cols)
-    ax = axes[row, col] if rows > 1 else axes[col]
-    ax.axis('off')
+    for j in range(num_components, len(axs)):
+        fig.delaxes(axs[j])
 
-final_path = os.path.join(output_dir, "all_embeddings_PCA_aligned_uniform.jpg")
-fig.tight_layout()
-fig.savefig(final_path, dpi=300, bbox_inches='tight')
-plt.close(fig)
+    fig.suptitle(f"PCs vs Numerosity – {arch_name}", fontsize=18)
+    fig.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(save_path, dpi=300)
+    plt.close()
 
-print("✅ PCA fatta per ogni rete con limiti comuni per tutti i plot.")
+    return correlation_results
+
+
+# Configuration
+configs = {
+    "uniform": {
+        "data_path": "/home/student/Desktop/Groundeep/circle_dataset_100x100/",
+        "data_file": "circle_dataset_100x100_v2.npz",
+        "network_dir": "/home/student/Desktop/Groundeep/networks/uniform/idbn_new_dataset",
+        "use_mds": True,
+        "output_subdir": "2D_MDS"
+    },
+    "zipfian": {
+        "data_path": "/home/student/Desktop/Groundeep/circle_dataset_100x100/",
+        "data_file": "circle_dataset_100x100_v2.npz",
+        "network_dir": "/home/student/Desktop/Groundeep/networks/zipfian/idbn_new_dataset",
+        "use_mds": True,
+        "output_subdir": "2D_MDS"
+    }
+}
+
+# Main loop
+for dist_name, cfg in configs.items():
+    print(f"\n📊 Processing 2D projection for distribution: {dist_name.upper()}")
+
+    data_path = cfg["data_path"]
+    data_file = cfg["data_file"]
+    network_dir = cfg["network_dir"]
+    use_mds = cfg.get("use_mds", False)
+    method_name = "2D MDS" if use_mds else "2D PCA"
+    output_dir = os.path.join(
+        "/home/student/Desktop/Groundeep/outputs/images_combined/new_dataset/",
+        cfg["output_subdir"], dist_name
+    )
+    os.makedirs(output_dir, exist_ok=True)
+
+    pkl_files = glob(os.path.join(network_dir, "*.pkl"))
+    correlations_list = []
+
+    for pkl_path in pkl_files:
+        arch_name = os.path.splitext(os.path.basename(pkl_path))[0]
+        print(f" - {arch_name}")
+
+        analyser = Embedding_analysis(
+            data_path,
+            data_file,
+            pkl_path,
+            pkl_path,
+            arch_name
+        )
+
+        output_dict = analyser._get_encodings()
+        embeddings = np.array(output_dict[f'Z_{dist_name}'], dtype=np.float64)
+
+        features = {
+            "N_list": np.array(output_dict[f'labels_{dist_name}']),
+            "cumArea": np.array(output_dict[f'cumArea_{dist_name}']),
+            "FA": np.array(output_dict[f'FA_{dist_name}']),
+            "CH": np.array(output_dict[f'CH_{dist_name}'])
+        }
+
+        # Correlation matrix
+        correlation_dir = os.path.join(output_dir, "correlation_matrix")
+        os.makedirs(correlation_dir, exist_ok=True)
+        matrix_path = os.path.join(correlation_dir, "feature_correlation_matrix.jpg")
+        plot_feature_correlation_matrix(features, save_path=matrix_path)
+
+        # 2D Embedding: PCA or MDS
+        if use_mds:
+            reducer = MDS(n_components=2, random_state=42, dissimilarity='euclidean', n_init=4, max_iter=300)
+        else:
+            reducer = PCA(n_components=2)
+        emb_2d = reducer.fit_transform(embeddings)
+
+        fig_path = os.path.join(output_dir, f"{arch_name}_{method_name.replace(' ', '_').lower()}_plot.jpg")
+        correlations = plot_2d_embedding_and_correlations(emb_2d, features, arch_name, fig_path, method_name=method_name)
+
+        for (feat_name, dim_label), corr_val in correlations.items():
+            correlations_list.append({
+                'arch': arch_name,
+                'feature': feat_name,
+                'PC': dim_label,
+                'correlation': corr_val
+            })
+
+        # PCs vs numerosity (PCA only)
+        if not use_mds:
+            all_pcs_path = os.path.join(output_dir, f"all_pcs/{arch_name}_all_pcs_vs_numerosity.jpg")
+            os.makedirs(os.path.dirname(all_pcs_path), exist_ok=True)
+            pc_corrs = plot_all_pcs_vs_numerosity(
+                embeddings,
+                features["N_list"],
+                arch_name,
+                all_pcs_path,
+                variance_threshold=0.03,
+                max_components=20
+            )
+            correlations_list.extend(pc_corrs)
+
+    # Save all correlations
+    df_corr = pd.DataFrame(correlations_list)
+    excel_path = os.path.join(output_dir, f"correlations_{dist_name}.xlsx")
+    df_corr.to_excel(excel_path, index=False)
+
+    print(f"✅ Finished {dist_name} — saved to: {output_dir}")
+
+print("\n🎉 All visualizations complete.")

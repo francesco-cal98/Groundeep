@@ -7,6 +7,8 @@ from scipy import io
 from scipy import io
 import scipy
 from scipy.stats import norm
+from scipy.optimize import curve_fit
+
 import torch
 
 import numpy as np
@@ -175,9 +177,37 @@ def num_size_spacing_model(choice, numLeft, numRight, isaLeft, isaRight, faLeft,
     intercept, betas, weber = irls_fit(choice, X, guessRate)
 
     return intercept, betas, weber, X
-
 def beta_extraction(choice, idxs, N_list, TSA_list, FA_list, guessRate=0.01):
-    # Initialize lists for the inputs
+    """
+    Extract parameters from paired indices and choices, filtering out invalid indices
+    and optionally filtering based on N_list values.
+
+    Args:
+        choice (array-like): Vector of choices (e.g., 0 or 1).
+        idxs (np.ndarray): Array of index pairs, shape (num_samples, 2).
+        N_list (np.ndarray): Array of counts (e.g., number of items).
+        TSA_list (np.ndarray): Array for TSA values corresponding to indices.
+        FA_list (np.ndarray): Array for FA values corresponding to indices.
+        guessRate (float): Guessing rate parameter for the model.
+
+    Returns:
+        model_fit, weber, prob_choice_right, X : Outputs from the num_size_spacing_model.
+    """
+
+    # Squeeze input arrays in case they have extra dimensions
+    N_list = np.squeeze(N_list)
+    TSA_list = np.squeeze(TSA_list)
+    FA_list = np.squeeze(FA_list)
+
+    # Ensure idxs is a numpy array and reshape to (num_samples, 2)
+    idxs_flat = np.asarray(idxs.cpu().detach()).reshape(-1, 2)
+
+    # Check for out-of-bounds indices early
+    max_idx = np.max(idxs_flat)
+    if max_idx >= len(N_list):
+        raise ValueError(f"Index {max_idx} out of bounds for N_list of length {len(N_list)}")
+
+    # Initialize output lists
     numLeft = []
     numRight = []
     isaLeft = []
@@ -186,61 +216,103 @@ def beta_extraction(choice, idxs, N_list, TSA_list, FA_list, guessRate=0.01):
     faRight = []
     filtered_choices = []
 
+    # Loop through all pairs of indices and filter invalid/out-of-range
+    for i, (idx_left, idx_right) in enumerate(idxs_flat):
+        idx_left = int(idx_left)
+        idx_right = int(idx_right)
 
-    # Flatten input arrays and extract pairs of indices
-    N_list = np.squeeze(N_list)
-    TSA_list = np.squeeze(TSA_list)
-    FA_list = np.squeeze(FA_list)
-    idxs_flat = idxs.view(-1, 2)
+        # Check if indices are valid (within range)
+        if idx_left >= len(N_list) or idx_right >= len(N_list):
+            continue  # skip invalid pairs
 
-    # Debugging: Inputs for left and right parameters
-    # print('--- Input Debugging ---')
-    # print(f'Number of trials: {len(choice)}')
-    # print(f'Choice vector: {np.sum(choice == 0)} left, {np.sum(choice == 1)} right')
-# Step 1: Create a boolean mask and get valid indices
-    mask = [n <= 14 for n in N_list]          # or: mask = np.array(N_list) > 14
-    valid_indices = set(i for i, valid in enumerate(mask) if valid)
+        # Optional: Filter pairs where N_list values are too large (>14)
+        if N_list[idx_left] > 14 or N_list[idx_right] > 14:
+            continue
 
-    # Step 2: Subset lists based on this condition
-    numLeft, numRight = [], []
-    isaLeft, isaRight = [], []
-    faLeft, faRight = [], []
-
-    for i, idx_pair in enumerate(idxs_flat):
-        idx_left, idx_right = int(idx_pair[0]), int(idx_pair[1])
-
-        # Only keep the pair if both indices pass the N_list filter
-        if idx_left in idxs_flat and idx_right in idxs_flat:
-            numLeft.append(N_list[idx_left])
-            numRight.append(N_list[idx_right])
-            isaLeft.append(TSA_list[idx_left] / N_list[idx_left])
-            isaRight.append(TSA_list[idx_right] / N_list[idx_right])
-            faLeft.append(FA_list[idx_left])
-            faRight.append(FA_list[idx_right])
-            filtered_choices.append(choice[i])
-
-    # Populate lists for left and right parameters based on indices
-    """
-        for idx_pair in idxs_flat:
-        idx_left, idx_right = int(idx_pair[0]), int(idx_pair[1])
-
+        # Append extracted parameters for valid pairs
         numLeft.append(N_list[idx_left])
         numRight.append(N_list[idx_right])
         isaLeft.append(TSA_list[idx_left] / N_list[idx_left])
         isaRight.append(TSA_list[idx_right] / N_list[idx_right])
         faLeft.append(FA_list[idx_left])
         faRight.append(FA_list[idx_right])
+        filtered_choices.append(choice[i])
 
-    """
+    # Convert lists to numpy arrays
+    numLeft = np.array(numLeft)
+    numRight = np.array(numRight)
+    isaLeft = np.array(isaLeft)
+    isaRight = np.array(isaRight)
+    faLeft = np.array(faLeft)
+    faRight = np.array(faRight)
+    filtered_choices = np.array(filtered_choices)
 
-    # Call the main model function to fit and calculate Weber fraction
+    # Now call your main model fitting function (you need to have it defined)
     model_fit, weber, prob_choice_right, X = num_size_spacing_model(
-        filtered_choices, np.array(numLeft), np.array(numRight), np.array(isaLeft),
-        np.array(isaRight), np.array(faLeft), np.array(faRight), guessRate
+        filtered_choices, numLeft, numRight, isaLeft, isaRight, faLeft, faRight, guessRate
     )
 
     return model_fit, weber, prob_choice_right, X
 
+
+
+from scipy.stats import norm
+from scipy.optimize import curve_fit
+import numpy as np
+
+def beta_extraction_numerosity(choice, idxs_test, N_list_test):
+    # Convert tensors to numpy
+    if isinstance(choice, torch.Tensor):
+        choice = choice.detach().cpu().numpy()
+    if isinstance(idxs_test, torch.Tensor):
+        idxs_test = idxs_test.detach().cpu().numpy()
+    if isinstance(N_list_test, torch.Tensor):
+        N_list_test = N_list_test.detach().cpu().numpy()
+
+    # Flatten one-hot choice if needed
+    if choice.ndim == 2 and choice.shape[1] == 2:
+        choice = np.argmax(choice, axis=1)
+    else:
+        choice = choice.flatten()
+
+    # Get numerosities for each side
+    N1 = N_list_test[idxs_test[:, 0]].flatten()
+    N2 = N_list_test[idxs_test[:, 1]].flatten()
+
+    # Ground truth: 1 if right (N2) > left (N1), else 0
+    true_choice = (N2 > N1).astype(int)
+
+    # Ratio: larger / smaller
+    ratios = np.maximum(N1, N2) / np.minimum(N1, N2)
+
+    # Compute accuracy at each unique ratio
+    x_vals = []
+    y_vals = []
+
+    for r in np.unique(ratios):
+        mask = np.isclose(ratios, r)
+        if np.sum(mask) == 0:
+            continue
+        acc = np.mean(choice[mask] == true_choice[mask])
+        x_vals.append(r)
+        y_vals.append(acc)
+
+    x_vals = np.array(x_vals)
+    y_vals = np.array(y_vals)
+
+    # Fit psychometric function
+    def psychometric(x, w):
+        return norm.cdf((x - 1) / (w * x))
+
+    try:
+        popt, _ = curve_fit(psychometric, x_vals, y_vals, p0=[0.3])
+        weber = popt[0]
+    except Exception as e:
+        print(f"Curve fit failed: {e}")
+        weber = np.nan
+
+    overall_acc = np.mean(choice == true_choice)
+    return weber, overall_acc
 """
 layer_sizes = [
     [500, 500], [500, 1000], [500, 1500], [500, 2000], 
