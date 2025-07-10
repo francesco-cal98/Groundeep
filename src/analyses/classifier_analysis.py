@@ -25,9 +25,10 @@ def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Paths
-    path_to_dbn_dir = "/home/student/Desktop/Groundeep/networks/zipfian/idbn_new_dataset/"
-    path_to_train_dataset = "/home/student/Desktop/Groundeep/pairs_from_mat_train.pkl"
-    path_to_test_dataset = "/home/student/Desktop/Groundeep/pairs_from_mat_test.pkl"
+    path_to_dbn_dir = "/home/student/Desktop/Groundeep/networks/zipfian/idbn_binary"
+    path_to_train_dataset = "/home/student/Desktop/Groundeep/circle_dataset_100x100/binary_de_wind_train.pkl"
+
+    path_to_test_dataset = "/home/student/Desktop/Groundeep/circle_dataset_100x100/binary_de_wind_test.pkl"
     test_file = "/home/student/Desktop/Groundeep/NumStim_7to28_100x100_TE.mat"
     output_folder = "/home/student/Desktop/Groundeep/outputs/results_excel_new_dataset"
     output_file = "model_coefficients_results_all_zipfian.xlsx"

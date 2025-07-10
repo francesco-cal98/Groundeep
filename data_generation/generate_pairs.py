@@ -6,7 +6,7 @@ from numpy.random import default_rng
 rng = default_rng()
 
 # Load dataset
-data = np.load('/home/student/Desktop/Groundeep/circle_dataset_100x100/circle_dataset_100x100_v2.npz')
+data = np.load('/home/student/Desktop/Groundeep/circle_dataset_100x100/circle_dataset_100x100_v1.npz')
 D = data['D']  # Image data, shape: (num_samples, 10000)
 N_list = data['N_list'].flatten()  # e.g., [7, 9, 14, ...]
 
