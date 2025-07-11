@@ -34,7 +34,7 @@ def main():
 
     # Load preprocessed training dataset
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train_loader, val_loader, test_loader = create_dataloaders_zipfian("/home/student/Desktop/Groundeep/circle_dataset_100x100","circle_dataset_100x100_v1.npz", batch_size = 128, num_workers = 1)
+    train_loader, val_loader, test_loader = create_dataloaders_uniform("/home/student/Desktop/Groundeep/circle_dataset_corr_tuned_v12","circle_dataset_100x100_corr_tuned_v12.npz", batch_size = 128, num_workers = 1)
     #train_loader, val_loader, test_loader = create_dataloaders_dunja("/home/student/Desktop/Groundeep/batched_train_data_from_mat.pkl", batch_size = 128, num_workers = 1,val_size = 0.02)
 
 

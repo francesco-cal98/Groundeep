@@ -9,7 +9,10 @@ from scipy.stats import spearmanr, ttest_rel
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LinearRegression
 import umap
-from skimage.metrics import structural_similarity as ssim_metric # Assicurati che scikit-image sia installato
+from scipy.fftpack import fft2
+import statsmodels.api as sm
+
+from skimage.metrics import structural_similarity as ssim # Assicurati che scikit-image sia installato
 
 # ==============================================================================
 # CLASSE: VisualizerWithLogging
@@ -207,109 +210,429 @@ class VisualizerWithLogging:
         }
         print(f"  RSA analysis for {arch_name}/{dist_name} completed.")
 
+    def mse_analysis(self, arch_name,embedding_analyzer):
+        original_inputs, reconstructed = embedding_analyzer.reconstruct_input()
+        out = embedding_analyzer.output_dict
 
-    def mse_analysis(self, arch_name, embedding_analyzer):
-        """
-        Calcola e logga l'Errore Quadratico Medio (MSE) per le ricostruzioni.
+        numerosities = out['labels_uniform']
+        numerosities_bin = out['numerosity_bin_uniform']
+        cumarea_bins = out['cumArea_bins_uniform']
+        cumarea_bin_ids = out['cumArea_uniform']
+        convex_hull_bins = out['convex_hull_bins_uniform']
+        convex_hull_bin = out['convex_hull_uniform']
 
-        Args:
-            arch_name (str): Nome dell'architettura.
-            embedding_analyzer (Embedding_analysis): L'istanza dell'analizzatore di embedding.
-        """
-        print(f"  Running MSE analysis for {arch_name}...")
-        original_inputs, reconstructed = embedding_analyzer.reconstruct_input(embedding_analyzer.inputs_uniform)
 
-        if original_inputs is None or reconstructed is None or len(original_inputs) == 0:
-            print(f"    Skipping MSE for {arch_name}: No reconstruction data available.")
-            return
+        mses = np.mean((original_inputs - reconstructed) ** 2, axis=1)
 
-        original_inputs = np.array(original_inputs)
-        reconstructed = np.array(reconstructed)
-
-        if original_inputs.shape != reconstructed.shape:
-            print(f"    Shape mismatch for {arch_name}: Original {original_inputs.shape} vs Reconstructed {reconstructed.shape}. Skipping MSE.")
-            return
-
-        mse = np.mean((original_inputs - reconstructed) ** 2)
-        self.all_mse_results.append({
-            "Architecture": arch_name,
-            "MSE": mse
+        df = pd.DataFrame({
+            "numerosity": numerosities_bin,
+            "cumarea_bin": cumarea_bin_ids,
+            "convex_hull_bin": convex_hull_bin,
+            "mse": mses
         })
-        self.wandb_run.log({f"reconstruction_metrics/{arch_name}/MSE": mse})
-        print(f"  MSE for {arch_name}: {mse:.4f}")
 
-    def afp_analysis(self, arch_name, embedding_analyzer):
-        """
-        Analisi AFP (Average Feature Presence) - Placeholder.
-        Questo è un placeholder. Se hai un modo specifico per calcolare AFP,
-        implementalo qui usando embedding_analyzer per accedere ai dati necessari.
-        """
-        print(f"  Running AFP analysis for {arch_name}...")
-        
-        # Esempio: se AFP dipendesse dagli activations del modello
-        # activations = embedding_analyzer.get_activations() # Metodo ipotetico
-        # if activations is not None and activations.shape[0] > 0:
-        #     # Calcola AFP in base ai tuoi criteri
-        #     dummy_afp_value = np.mean(activations > 0) # Esempio molto semplice
-        # else:
-        #     dummy_afp_value = np.nan
-        #     print(f"    No activations available for AFP for {arch_name}.")
-        
-        # Per ora, registra un valore dummy
-        dummy_afp_value = np.random.rand() * 10 
-        
-        self.all_afp_results.append({
-            "Architecture": arch_name,
-            "AFP": dummy_afp_value
+        pivot_table = df.groupby(["cumarea_bin", "numerosity"])["mse"].mean().unstack(fill_value=np.nan)
+        pivot_table = pivot_table.sort_index(ascending=False)  # Ordina cumulative area dal basso verso l'alto
+
+        plt.figure(figsize=(10, 6))
+        sns.heatmap(pivot_table, annot=True, fmt=".3f", cmap="viridis")
+        plt.title(f"MSE Heatmap – {arch_name}")
+        plt.xlabel("Numerosity_bin")
+        plt.ylabel("Cum-Area bin")
+        plt.tight_layout()
+        self.wandb_run.log({f"{arch_name}/mse_heatmap_cumarea": wandb.Image(plt.gcf())})
+        plt.close()
+
+        pivot_hull = df.groupby(["convex_hull_bin", "numerosity"])["mse"].mean().unstack(fill_value=np.nan)
+        pivot_hull = pivot_hull.sort_index(ascending=False)
+
+        plt.figure(figsize=(10, 6))
+        sns.heatmap(pivot_hull, annot=True, fmt=".3f", cmap="viridis")
+        plt.title(f"MSE Heatmap – Convex Hull vs Numerosity – {arch_name}")
+        plt.xlabel("Numerosity_bin")
+        plt.ylabel("Convex Hull bin")
+        plt.tight_layout()
+        self.wandb_run.log({f"{arch_name}/mse_heatmap_convexhull": wandb.Image(plt.gcf())})
+        plt.close()
+
+
+            # === MSE vs Numerosity per ciascun livello di Cumulative Area + linea globale ===
+        plt.figure(figsize=(8, 5))
+
+        # Linea globale: MSE medio per numerosity su tutto il dataset
+        mse_vs_numerosity = df.groupby("numerosity")["mse"].mean()
+        plt.plot(
+            mse_vs_numerosity.index, 
+            mse_vs_numerosity.values, 
+            label="All CumAreas", 
+            color="black", 
+            linestyle="--", 
+            linewidth=2
+        )
+
+        # Linee per ogni livello di cumarea_bin
+        for cumarea_level, group in df.groupby("cumarea_bin"):
+            mse_by_numerosity = group.groupby("numerosity")["mse"].mean()
+            plt.plot(
+                mse_by_numerosity.index, 
+                mse_by_numerosity.values, 
+                label=f"CumArea Bin {cumarea_level}", 
+                marker='o'
+            )
+            
+
+        plt.title(f"MSE vs Numerosity per Cumulative Area – {arch_name}")
+        plt.xlabel("Numerosity")
+        plt.ylabel("Mean MSE")
+        plt.legend(title="Legend")
+        plt.grid(True)
+        plt.tight_layout()
+
+        # Log su Weights & Biases
+        wandb.log({f"{arch_name}/mse_vs_numerosity_by_cumarea_with_total": wandb.Image(plt.gcf())})
+        plt.close()
+
+        reg_df = pd.DataFrame({
+            "numerosity": out["labels_uniform"],
+            "cumulative_area": out["cumArea_uniform"],
+            "convex_hull": out["convex_hull_uniform"],
+            "mse": mses
         })
-        self.wandb_run.log({f"feature_metrics/{arch_name}/AFP": dummy_afp_value})
-        print(f"  AFP for {arch_name}: {dummy_afp_value:.4f} (Dummy Value)")
+
+        X = reg_df[["numerosity", "cumulative_area", "convex_hull"]]
+        y = reg_df["mse"]
+        X_const = sm.add_constant(X)
+        model = sm.OLS(y, X_const).fit()
+
+        coeffs = model.params
+        pvals = model.pvalues
+        conf_int = model.conf_int()
+
+        self.wandb_run.log({
+            f"{arch_name}/regression_coefficients": wandb.Table(
+                columns=["Variable", "Coef", "P-value", "CI_lower", "CI_upper"],
+                data=[
+                    [var, float(coeffs[var]), float(pvals[var]), float(conf_int.loc[var][0]), float(conf_int.loc[var][1])]
+                    for var in coeffs.index
+                ]
+            )
+        })
 
 
-    def ssim_analysis(self, arch_name, embedding_analyzer):
-        """
-        Calcola e logga l'Indice di Similarità Strutturale (SSIM) per le ricostruzioni.
 
-        Args:
-            arch_name (str): Nome dell'architettura.
-            embedding_analyzer (Embedding_analysis): L'istanza dell'analizzatore di embedding.
-        """
-        print(f"  Running SSIM analysis for {arch_name}...")
-        original_inputs, reconstructed = embedding_analyzer.reconstruct_input(embedding_analyzer.inputs_uniform)
 
-        if original_inputs is None or reconstructed is None or len(original_inputs) == 0:
-            print(f"    Skipping SSIM for {arch_name}: No reconstruction data available.")
-            return
 
-        img_size = 100 # Assicurati che questa dimensione sia corretta per i tuoi dati
-        
-        ssim_values = []
-        for i in range(min(len(original_inputs), len(reconstructed))):
-            try:
-                img1 = original_inputs[i].reshape(img_size, img_size)
-                img2 = reconstructed[i].reshape(img_size, img_size)
-                
-                img1 = img1.astype(float)
-                img2 = img2.astype(float)
+    def compute_afp(self,img1, img2, img_shape=(100, 100)):
+        # Reshape se necessario
+        if img1.ndim == 1:
+            img1 = img1.reshape(img_shape)
+        if img2.ndim == 1:
+            img2 = img2.reshape(img_shape)
 
-                # data_range è la differenza tra il massimo e il minimo valore possibile dei pixel.
-                # Per immagini binarie normalizzate tra 0 e 1, è 1.0.
-                current_ssim = ssim_metric(img1, img2, data_range=1.0) 
-                ssim_values.append(current_ssim)
-            except Exception as e:
-                print(f"    Error calculating SSIM for sample {i} of {arch_name}: {e}. Skipping.")
+        # Fourier amplitude
+        fft1 = np.abs(fft2(img1))
+        fft2_ = np.abs(fft2(img2))
+
+        # Normalizza
+        fft1 /= np.sum(fft1)
+        fft2_ /= np.sum(fft2_)
+
+        return np.sum(np.abs(fft1 - fft2_))
+
+
+
+    def afp_analysis(self, arch_name,embedding_analyzer):
+        original_inputs, reconstructed = embedding_analyzer.reconstruct_input()
+        out = embedding_analyzer.output_dict
+
+        # === Feature bins ===
+        numerosities = out['labels_uniform']
+        numerosities_bin = out['numerosity_bin_uniform']
+        cumarea_bins = out['cumArea_bins_uniform']
+        cumarea = out['cumArea_uniform']
+        convex_hull_bins = out['convex_hull_bins_uniform']
+        convex_hull = out['convex_hull_uniform']
+        items_uniform = out['Items_uniform']
+        items_uniform_bin = out['Items_bins_uniform']
+
+
+        # === AFP per immagine ===
+        afps = np.array([
+            self.compute_afp(original_inputs[i], reconstructed[i])
+            for i in range(len(original_inputs))
+        ])
+
+        df = pd.DataFrame({
+            "numerosity": numerosities_bin,
+            "cumarea": cumarea,
+            "convex_hull": convex_hull,
+            "afp": afps
+        })
+
+        # === Heatmap CumArea x Numerosity ===
+        pivot_table = df.groupby(["cumarea", "numerosity"])["afp"].mean().unstack(fill_value=np.nan)
+        pivot_table = pivot_table.sort_index(ascending=False)
+
+        plt.figure(figsize=(10, 6))
+        sns.heatmap(pivot_table, annot=True, fmt=".3f", cmap="plasma")
+        plt.title(f"AFP Heatmap – {arch_name}")
+        plt.xlabel("Numerosity_bin")
+        plt.ylabel("Cum-Area bin")
+        plt.tight_layout()
+        self.wandb_run.log({f"{arch_name}/afp_heatmap_cumarea": wandb.Image(plt.gcf())})
+        plt.close()
+
+        # === Heatmap Convex Hull ===
+        pivot_hull = df.groupby(["convex_hull", "numerosity"])["afp"].mean().unstack(fill_value=np.nan)
+        pivot_hull = pivot_hull.sort_index(ascending=False)
+
+        plt.figure(figsize=(10, 6))
+        sns.heatmap(pivot_hull, annot=True, fmt=".3f", cmap="plasma")
+        plt.title(f"AFP Heatmap – Convex Hull vs Numerosity – {arch_name}")
+        plt.xlabel("Numerosity_bin")
+        plt.ylabel("Convex Hull bin")
+        plt.tight_layout()
+        self.wandb_run.log({f"{arch_name}/afp_heatmap_convexhull": wandb.Image(plt.gcf())})
+        plt.close()
+
+        # === Line plot AFP vs Numerosity ===
+        plt.figure(figsize=(8, 5))
+        afp_vs_numerosity = df.groupby("numerosity")["afp"].mean()
+        plt.plot(
+            afp_vs_numerosity.index,
+            afp_vs_numerosity.values,
+            label="All CumAreas",
+            color="black",
+            linestyle="--",
+            linewidth=2
+        )
+        self.wandb_run.log({f"{arch_name}/afp_vs_numerosity_by_cumarea_with_total": wandb.Image(plt.gcf())})
+
+        for cumarea_level, group in df.groupby("cumarea"):
+            afp_by_numerosity = group.groupby("numerosity")["afp"].mean()
+            plt.plot(
+                afp_by_numerosity.index,
+                afp_by_numerosity.values,
+                label=f"CumArea Bin {cumarea_level}",
+                marker='o'
+            )
+
+        plt.title(f"AFP vs Numerosity per Cumulative Area – {arch_name}")
+        plt.xlabel("Numerosity")
+        plt.ylabel("Mean AFP")
+        plt.legend(title="Legend")
+        plt.grid(True)
+        plt.tight_layout()
+        self.wandb_run.log({f"{arch_name}/afp_vs_numerosity_by_cumarea_with_total": wandb.Image(plt.gcf())})
+        plt.close()
+
+        # === Regressione multipla (Numerosità, Area, CH → AFP) ===
+        reg_df = pd.DataFrame({
+            "numerosity": out["labels_uniform"],
+            "cumulative_area": out["cumArea_uniform"],
+            "convex_hull": out["convex_hull_uniform"],
+            "afp": afps
+        })
+
+        X = reg_df[["numerosity", "cumulative_area", "convex_hull"]]
+        y = reg_df["afp"]
+        X_const = sm.add_constant(X)
+        model = sm.OLS(y, X_const).fit()
+
+        coeffs = model.params
+        pvals = model.pvalues
+        conf_int = model.conf_int()
+
+        self.wandb_run.log({
+            f"{arch_name}/afp_regression_coefficients": wandb.Table(
+                columns=["Variable", "Coef", "P-value", "CI_lower", "CI_upper"],
+                data=[
+                    [var, float(coeffs[var]), float(pvals[var]), float(conf_int.loc[var][0]), float(conf_int.loc[var][1])]
+                    for var in coeffs.index
+                ]
+            )
+        })
+
+        # === AFP vs features: plot separati ===
+        panel_key_sep = f"{arch_name}/afp_vs_features"
+
+        afp_scores = [
+            self.compute_afp(orig, recon)
+            for orig, recon in zip(original_inputs, reconstructed)
+        ]
+
+        afp_df = pd.DataFrame({"afp": afp_scores})
+        feature_map = {
+            "numerosity": numerosities,
+            "cumarea": cumarea,
+            "convex_hull": convex_hull,
+            "items_uniform": items_uniform
+        }
+
+        for feat_name, feat_values in feature_map.items():
+            if feat_values is None:
+                print(f"⚠️ Feature '{feat_name}' non trovata, skip.")
                 continue
-        
-        if ssim_values:
-            avg_ssim = np.mean(ssim_values)
-            self.all_ssim_results.append({
-                "Architecture": arch_name,
-                "SSIM": avg_ssim
+
+            afp_df[feat_name] = feat_values
+            agg = afp_df.groupby(feat_name)["afp"].mean()
+
+            plt.figure(figsize=(8, 5))
+            plt.plot(
+                agg.index,
+                agg.values,
+                marker="o",
+                linestyle="-"
+            )
+            plt.title(f"AFP vs {feat_name.replace('_',' ').title()} – {arch_name}")
+            plt.xlabel(feat_name.replace('_',' ').title())
+            plt.ylabel("Mean AFP")
+            plt.grid(True)
+            plt.tight_layout()
+
+            self.wandb_run.log({f"{panel_key_sep}/{arch_name}/AFP_vs_{feat_name}": wandb.Image(plt.gcf())})
+            plt.close()
+
+
+        # === AFP vs features: plot combinato ===
+        panel_key_combined = f"{arch_name}/afp_vs_features_combined"
+
+        plt.figure(figsize=(10, 6))
+        for feat_name, feat_values in feature_map.items():
+            if feat_values is None:
+                continue
+
+            afp_df[feat_name] = feat_values.astype(int)
+            agg = afp_df.groupby(feat_name)["afp"].mean()
+
+            plt.plot(
+                agg.index,
+                agg.values,
+                marker="o",
+                linestyle="-",
+                label=feat_name.replace('_', ' ').title()
+            )
+
+        plt.title(f"AFP vs Features – {arch_name}")
+        plt.xlabel("Feature Value")
+        plt.ylabel("Mean AFP")
+        plt.legend(title="Feature")
+        plt.grid(True)
+        plt.tight_layout()
+
+        self.wandb_run.log({f"{panel_key_combined}": wandb.Image(plt.gcf())})
+        plt.close()
+
+    def ssim_analysis(self, arch_name,embedding_analyzer):
+
+        original_inputs, reconstructed = embedding_analyzer.reconstruct_input()
+        out = embedding_analyzer.output_dict
+
+        numerosities = out['labels_uniform']
+        cumarea = out['cumArea_uniform']
+        convex_hull = out['convex_hull_uniform']
+        items_uniform = out['Items_uniform']
+
+        # Calcolo SSIM
+        ssim_scores = [
+            ssim(orig, recon, data_range=1.0)
+            for orig, recon in zip(original_inputs, reconstructed)
+        ]
+
+        ssim_df = pd.DataFrame({
+            "ssim": ssim_scores
+        })
+
+        feature_map = {
+            "numerosity": numerosities,
+            "cumarea": cumarea,
+            "convex_hull": convex_hull,
+            "items_uniform": items_uniform
+        }
+
+        reg_df = pd.DataFrame({
+            "numerosity": out["labels_uniform"],
+            "cumulative_area": out["cumArea_uniform"],
+            "convex_hull": out["convex_hull_uniform"],
+            "ssim": ssim_scores
+        })
+
+        X = reg_df[["numerosity", "cumulative_area", "convex_hull"]]
+        y = reg_df["ssim"]
+        X_const = sm.add_constant(X)
+        model = sm.OLS(y, X_const).fit()
+
+        coeffs = model.params
+        pvals = model.pvalues
+        conf_int = model.conf_int()
+
+        self.wandb_run.log({
+            f"{arch_name}/ssim_regression_coefficients": wandb.Table(
+                columns=["Variable", "Coef", "P-value", "CI_lower", "CI_upper"],
+                data=[
+                    [var, float(coeffs[var]), float(pvals[var]), float(conf_int.loc[var][0]), float(conf_int.loc[var][1])]
+                    for var in coeffs.index
+                ]
+            )
+        })
+
+
+        # === Plots separati per feature ===
+        for feat_name, feat_values in feature_map.items():
+            if feat_values is None:
+                print(f"⚠️ Feature '{feat_name}' non trovata, skip.")
+                continue
+
+            ssim_df[feat_name] = feat_values.astype(int)
+            agg = ssim_df.groupby(feat_name)["ssim"].mean()
+
+            plt.figure(figsize=(8, 5))
+            plt.plot(
+                agg.index,
+                agg.values,
+                marker="o",
+                linestyle="-"
+            )
+            plt.title(f"SSIM vs {feat_name.replace('_',' ').title()} – {arch_name}")
+            plt.xlabel(feat_name.replace('_',' ').title())
+            plt.ylabel("Mean SSIM")
+            plt.grid(True)
+            plt.tight_layout()
+
+            self.wandb_run.log({
+                f"{arch_name}/ssim_vs_{feat_name}": wandb.Image(plt.gcf())
             })
-            self.wandb_run.log({f"reconstruction_metrics/{arch_name}/SSIM": avg_ssim})
-            print(f"  Avg SSIM for {arch_name}: {avg_ssim:.4f}")
-        else:
-            print(f"    No SSIM values calculated for {arch_name}.")
+            plt.close()
+
+        # === Plot combinato ===
+        plt.figure(figsize=(10, 6))
+        for feat_name, feat_values in feature_map.items():
+            if feat_values is None:
+                continue
+
+            ssim_df[feat_name] = feat_values.astype(int)
+            agg = ssim_df.groupby(feat_name)["ssim"].mean()
+
+            plt.plot(
+                agg.index,
+                agg.values,
+                marker="o",
+                linestyle="-",
+                label=feat_name.replace('_', ' ').title()
+            )
+
+        plt.title(f"SSIM vs Features – {arch_name}")
+        plt.xlabel("Feature Value")
+        plt.ylabel("Mean SSIM")
+        plt.legend(title="Feature")
+        plt.grid(True)
+        plt.tight_layout()
+
+        self.wandb_run.log({
+            f"{arch_name}/ssim_vs_features_combined": wandb.Image(plt.gcf())
+        })
+        plt.close()
+
 
 
     def plot_feature_correlation_matrix(self, features, arch_name, dist_name):
@@ -432,7 +755,12 @@ class VisualizerWithLogging:
             rho_dim2, _ = spearmanr(emb_2d[:, 1], values)
             correlations[f"{feat_name}_dim2"] = rho_dim2
 
-            sc = axs[i].scatter(emb_2d[:, 0], emb_2d[:, 1], c=values, cmap='viridis', s=40, alpha=0.8)
+            if feat_name == "N_list":
+                color_values = np.log(values)
+            else:
+                color_values = values
+
+            sc = axs[i].scatter(emb_2d[:, 0], emb_2d[:, 1], c=color_values, cmap='viridis', s=40, alpha=0.8)
             axs[i].set_title(f"Feature: {feat_name}\nDim1={correlations[f'{feat_name}_dim1']:.2f}, Dim2={correlations[f'{feat_name}_dim2']:.2f}")
             axs[i].set_xlabel(f"{method_name}-1")
             axs[i].set_ylabel(f"{method_name}-2")
@@ -504,119 +832,3 @@ class VisualizerWithLogging:
             plt.close()
             print(f"  📦 Combined RSA boxplot saved to: {boxplot_path}")
 
-
-    def generate_latex_report_data(self):
-        """
-        Genera i dati formattati per il report LaTeX.
-        Accede a `self.rsa_data_for_latex` e altri dati accumulati.
-        """
-        print("\n📝 Generating LaTeX report data...")
-        
-        latex_output = ""
-        latex_output += "\\documentclass{article}\n"
-        latex_output += "\\usepackage[utf8]{inputenc}\n"
-        latex_output += "\\usepackage{amsmath}\n"
-        latex_output += "\\usepackage{amssymb}\n"
-        latex_output += "\\usepackage{graphicx}\n"
-        latex_output += "\\usepackage{booktabs}\n" # For better table lines
-        latex_output += "\\usepackage[T1]{fontenc}\n"
-        latex_output += "\\usepackage{float}\n" # For [H] placement
-        latex_output += "\\usepackage{hyperref}\n" # For hyperlinks
-        latex_output += "\\hypersetup{colorlinks=true, linkcolor=blue, urlcolor=cyan}\n"
-        latex_output += "\\title{Analisi degli Embedding delle Reti DBN}\n"
-        latex_output += "\\author{}\n"
-        latex_output += "\\date{"+ pd.Timestamp.now().strftime('%d %B %Y') +"}\n" # Automatically add current date
-        latex_output += "\\begin{document}\n"
-        latex_output += "\\maketitle\n"
-
-        latex_output += "\\section*{Risultati RSA (Representational Similarity Analysis)}\n"
-        latex_output += "Di seguito sono riportate le correlazioni di Spearman ($\\rho$) tra le RDM cerebrali "
-        latex_output += "e le RDM dei modelli di feature per le diverse architetture e distribuzioni, "
-        latex_output += "insieme ai valori Z di Fisher per il confronto tra i modelli di numerosità.\\\n"
-        latex_output += "Un valore Z positivo indica che il primo modello correlato è più fortemente "
-        latex_output += "correlato agli embedding rispetto al secondo modello.\\\n\n"
-
-
-        for dist_name, arch_data in self.rsa_data_for_latex.items():
-            latex_output += f"\\subsection*{{Distribuzione: {dist_name.capitalize()}}}\n"
-            latex_output += "\\begin{table}[H]\n"
-            latex_output += "\\centering\n"
-            latex_output += "\\caption{Correlazioni RSA per la distribuzione " + dist_name.capitalize() + "}\n"
-            latex_output += "\\label{tab:rsa_" + dist_name + "}\n"
-            # Ho aggiunto un'ulteriore colonna per Z (Log vs Sqrt) per coerenza con rsa_analysis
-            latex_output += "\\begin{tabular}{l c c c c c}\n" 
-            latex_output += "\\toprule\n"
-            latex_output += "Architettura & $\\rho$ (Log) & $\\rho$ (Linear) & $\\rho$ (CumArea) & Z (Log vs Linear) & Z (Log vs Sqrt) \\\\\n"
-            latex_output += "\\midrule\n"
-            for arch_name, metrics in arch_data.items():
-                log_rho = f"{metrics.get('numerosity_log_rho', np.nan):.3f}" if not np.isnan(metrics.get('numerosity_log_rho', np.nan)) else "N/A"
-                linear_rho = f"{metrics.get('numerosity_linear_rho', np.nan):.3f}" if not np.isnan(metrics.get('numerosity_linear_rho', np.nan)) else "N/A"
-                cumarea_rho = f"{metrics.get('cumArea_rho', np.nan):.3f}" if not np.isnan(metrics.get('cumArea_rho', np.nan)) else "N/A"
-                z_log_lin = f"{metrics.get('log_vs_linear_z', np.nan):.2f}" if not np.isnan(metrics.get('log_vs_linear_z', np.nan)) else "N/A"
-                z_log_sqrt = f"{metrics.get('log_vs_sqrt_z', np.nan):.2f}" if not np.isnan(metrics.get('log_vs_sqrt_z', np.nan)) else "N/A"
-                
-                latex_output += f"{arch_name} & {log_rho} & {linear_rho} & {cumarea_rho} & {z_log_lin} & {z_log_sqrt} \\\\\n"
-            latex_output += "\\bottomrule\n"
-            latex_output += "\\end{tabular}\n"
-            latex_output += "\\end{table}\n\n"
-
-        # Aggiungi grafici RSA combinati
-        latex_output += "\\begin{figure}[H]\n"
-        latex_output += "\\centering\n"
-        latex_output += "\\includegraphics[width=0.9\\textwidth]{rsa_combined_boxplot.jpg}\n"
-        latex_output += "\\caption{Boxplot delle correlazioni RSA tra embedding e modelli di feature per diverse distribuzioni e encoding.}\n"
-        latex_output += "\\label{fig:rsa_combined_boxplot}\n"
-        latex_output += "\\end{figure}\n\n"
-        
-        latex_output += "\\begin{figure}[H]\n"
-        latex_output += "\\centering\n"
-        latex_output += "\\includegraphics[width=0.9\\textwidth]{rsa_barplot_zipfian.jpg}\n"
-        latex_output += "\\caption{Correlazioni RSA per la distribuzione Zipfian (modelli di numerosità).}\n"
-        latex_output += "\\label{fig:rsa_barplot_zipfian}\n"
-        latex_output += "\\end{figure}\n\n"
-
-        latex_output += "\\begin{figure}[H]\n"
-        latex_output += "\\centering\n"
-        latex_output += "\\includegraphics[width=0.9\\textwidth]{rsa_barplot_uniform.jpg}\n"
-        latex_output += "\\caption{Correlazioni RSA per la distribuzione Uniforme (modelli di numerosità).}\n"
-        latex_output += "\\label{fig:rsa_barplot_uniform}\n"
-        latex_output += "\\end{figure}\n\n"
-        
-        latex_output += "\\begin{figure}[H]\n"
-        latex_output += "\\centering\n"
-        latex_output += "\\includegraphics[width=0.9\\textwidth]{rsa_barplot_combined_facetgrid.jpg}\n"
-        latex_output += "\\caption{Correlazioni RSA attraverso architetture e distribuzioni (modelli di numerosità).}\n"
-        latex_output += "\\label{fig:rsa_barplot_combined_facetgrid}\n"
-        latex_output += "\\end{figure}\n\n"
-
-        latex_output += "\\section*{Risultati MSE (Mean Squared Error)}\n"
-        if self.all_mse_results:
-            df_mse = pd.DataFrame(self.all_mse_results)
-            latex_output += "\\begin{table}[H]\n"
-            latex_output += "\\centering\n"
-            latex_output += "\\caption{MSE delle ricostruzioni per architettura}\n"
-            latex_output += "\\label{tab:mse_results}\n"
-            latex_output += df_mse.to_latex(index=False, float_format="%.4f")
-            latex_output += "\\end{table}\n\n"
-        else:
-            latex_output += "Nessun dato MSE disponibile.\\\n\n"
-
-        latex_output += "\\section*{Risultati SSIM (Structural Similarity Index)}\n"
-        if self.all_ssim_results:
-            df_ssim = pd.DataFrame(self.all_ssim_results)
-            latex_output += "\\begin{table}[H]\n"
-            latex_output += "\\centering\n"
-            latex_output += "\\caption{SSIM delle ricostruzioni per architettura}\n"
-            latex_output += "\\label{tab:ssim_results}\n"
-            latex_output += df_ssim.to_latex(index=False, float_format="%.4f")
-            latex_output += "\\end{table}\n\n"
-        else:
-            latex_output += "Nessun dato SSIM disponibile.\\\n\n"
-
-        latex_output += "\\end{document}\n"
-
-        report_path = os.path.join(self.output_dir, "analysis_report.tex")
-        with open(report_path, "w") as f:
-            f.write(latex_output)
-        print(f"  LaTeX report generated at: {report_path}")
-        print("  Per compilare il PDF, esegui: pdflatex analysis_report.tex")

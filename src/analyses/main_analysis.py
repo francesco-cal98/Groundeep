@@ -21,14 +21,14 @@ from src.utils.wandb_utils import log_reconstructions_to_wandb
 # === Configuration ===
 configs = {
     "uniform": {
-        "data_path": "/home/student/Desktop/Groundeep/circle_dataset_100x100",
-        "data_file": "circle_dataset_100x100_v1.npz",
-        "network_dir": "/home/student/Desktop/Groundeep/networks/uniform/idbn_binary"
+        "data_path": "/home/student/Desktop/Groundeep/circle_dataset_corr_tuned_v12",
+        "data_file": "circle_dataset_100x100_corr_tuned_v12.npz",
+        "network_dir": "/home/student/Desktop/Groundeep/networks/uniform/idbn_binary_v3"
     },
     "zipfian": {
         "data_path": "/home/student/Desktop/Groundeep/circle_dataset_100x100",
-        "data_file": "circle_dataset_100x100_v1.npz",
-        "network_dir": "/home/student/Desktop/Groundeep/networks/zipfian/idbn_binary"
+        "data_file": "binarized_data.npz",
+        "network_dir": "/home/student/Desktop/Groundeep/networks/zipfian/idbn_binary_V3"
     }
 }
 
