@@ -19,7 +19,7 @@ from sklearn.metrics import accuracy_score
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def forwardrbm(self, v):
-    p_h = torch.sigmoid(torch.matmul(v, self.W) + self.hid_bias)
+    p_h = torch.sigmoid(torch.matmul(v.float(), self.W) + self.hid_bias)
     h = (p_h > torch.rand_like(p_h)).float()  # Stochastic activation
     return p_h, h
 def forwardDBN(self, X):
@@ -76,7 +76,7 @@ def classifier(Xtrain, Xtest, Ytrain, Ytest):
     print('Train Accuracy:', accuracy_train)
     print('Test Accuracy:', accuracy_test)
 
-    return accuracy_train, predicted_train, accuracy_test, predicted_test
+    return accuracy_train, predicted_train, accuracy_test, predicted_test,weights
 
 
 def irls_fit(choice, X, guessRate=0.01, max_iter=5000, tol=1e-12):
