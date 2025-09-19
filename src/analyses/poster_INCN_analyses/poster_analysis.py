@@ -431,7 +431,6 @@ configs = {
 global_output_base_dir = "/home/student/Desktop/Groundeep/outputs/analysis_results_poster/" 
 os.makedirs(global_output_base_dir, exist_ok=True)
 
-#os.environ['WANDB_API_KEY']='91fc380c0e7e443c45abd10540ae8e907d735e3a'
 
 # === Init WandB ===
 run = wandb.init(project="groundeep-visualization2")

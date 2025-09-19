@@ -6,6 +6,7 @@ import gc
 
 from scipy.stats import spearmanr
 from statsmodels.stats.multitest import fdrcorrection
+from torch.utils.data import Subset, DataLoader
 
 current_dir = os.getcwd()
 sys.path.append(current_dir)  # Add the project root to sys.path
@@ -31,7 +32,7 @@ import pandas as pd
 
 class Embedding_analysis:
 
-    def __init__(self,path2data,data_name,model_uniform,model_zipfian,arch_name,val_size = 0.01):
+    def __init__(self,path2data,data_name,model_uniform,model_zipfian,arch_name,val_size = 0.005):
         
         self.path2data = path2data
         self.data_name = data_name
@@ -67,15 +68,9 @@ class Embedding_analysis:
             self.model_zipfian = pkl.load(f)
     
     def _get_encodings(self):
-        import gc
-        import torch
-        import pandas as pd
 
-        if torch.cuda.is_available():
-            device = torch.device('cuda:0')
-        else:
-            device = torch.device('cpu')
 
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         self.output_dict = {}
 
         # === Estrai batch uniforme (intero dataset) ===
@@ -93,63 +88,88 @@ class Embedding_analysis:
         Z_uniform = h2_probs_uniform.cpu().numpy()
         Z_zipfian = h2_probs_zipfian.cpu().numpy()
 
-        #del self.model_uniform, self.model_zipfian
-        self.inputs_uniform = inputs_uniform.detach().cpu()  # Store a copy for reconstruction analysis
-
+        self.inputs_uniform = inputs_uniform.detach().cpu()
         gc.collect()
         torch.cuda.empty_cache()
 
-        self.output_dict['Z_uniform'] = Z_uniform
-        self.output_dict['Z_zipfian'] = Z_zipfian
-        self.output_dict['labels_uniform'] = self.labels_uniform.cpu().numpy()
-        self.output_dict['labels_zipfian'] = self.labels_uniform.cpu().numpy()
-        numerosity_bins_uniform = pd.cut(
-        self.output_dict['labels_uniform'],
-            bins=[0, 4, 8, 12, 16, 20, 24, 28,32],  # scegli i bin come preferisci
-            labels=["1–4", "5–8", "9–12", "13–16", "17–20", "21–24", "25–28", "29–32"],
-        )
-        self.output_dict['numerosity_bin_uniform'] = numerosity_bins_uniform
         # === Uniform features ===
         indices_uniform = self.dataset_uniform_subset.indices
         cumArea_vals_uniform = [self.dataset_uniform.cumArea_list[i] for i in indices_uniform]
         convex_hull_uniform = [self.dataset_uniform.CH_list[i] for i in indices_uniform]
-        items_uniform = [self.dataset_uniform.Items_list[i] for i in indices_uniform]
-        self.output_dict['FA_uniform'] = [self.dataset_uniform.FA_list[i] for i in indices_uniform]
-        self.output_dict['CH_uniform'] = [self.dataset_uniform.CH_list[i] for i in indices_uniform]
-        self.output_dict['cumArea_uniform'] = cumArea_vals_uniform
-        self.output_dict['Items_uniform'] = items_uniform
-        # generating binned features
+        #items_vals_uniform = [self.dataset_uniform.Items_list[i] for i in indices_uniform]
+        #fa_uniform = [self.dataset_uniform.FA_list[i] for i in indices_uniform]
+        ch_uniform = [self.dataset_uniform.CH_list[i] for i in indices_uniform]
+
+        # === FILTRO: sopra la mediana di Items ===
+        #items_array = np.array(items_vals_uniform)
+        #mask = items_array > np.median(items_array)
+        #self.filtered_indices_uniform = np.array(indices_uniform)[mask]
+
+        #filtered_subset = Subset(self.dataset_uniform, self.filtered_indices_uniform)
+       # self.filtered_dataloader_uniform = DataLoader(filtered_subset, batch_size=len(filtered_subset), shuffle=False)
+
+
+        # Applica il filtro a tutte le variabili uniformi
+        self.output_dict['Z_uniform'] = Z_uniform
+        self.output_dict['Z_zipfian'] = Z_zipfian
+        self.output_dict['labels_uniform'] = self.labels_uniform.cpu().numpy()
+        self.output_dict['labels_zipfian'] = self.labels_uniform.cpu().numpy()
+        #self.output_dict['FA_uniform'] = np.array(fa_uniform)
+        self.output_dict['CH_uniform'] = np.array(ch_uniform)
+        self.output_dict['cumArea_uniform_raw'] = np.array(cumArea_vals_uniform)
+        #self.output_dict['Items_uniform_raw'] = items_array[mask]
+
+        # === Bin numerosity ===
+        numerosity_bins_uniform = pd.cut(
+            self.output_dict['labels_uniform'],
+            bins=[0, 4, 8, 12, 16, 20, 24, 28, 32],
+            labels=["1–4", "5–8", "9–12", "13–16", "17–20", "21–24", "25–28", "29–32"],
+        )
+        self.output_dict['numerosity_bin_uniform'] = numerosity_bins_uniform
+
+        # === Binned features dopo filtro ===
         cumArea_quantiles_uniform, cumArea_bins_uniform = pd.qcut(
-            cumArea_vals_uniform, q=8, labels=False, retbins=True, duplicates='drop'
+            self.output_dict['cumArea_uniform_raw'], q=5, labels=False, retbins=True, duplicates='drop'
         )
-        convex_hull_quantiles_uniform,  convex_hull_bins_uniform = pd.qcut(
-            convex_hull_uniform, q=8, labels=False, retbins=True, duplicates='drop'
+        convex_hull_quantiles_uniform, convex_hull_bins_uniform = pd.qcut(
+            self.output_dict['CH_uniform'], q=5, labels=False, retbins=True, duplicates='drop'
         )
-        Items_quantiles_uniform, Items_bins_uniform = pd.qcut(
-            items_uniform, q=8, labels=False, retbins=True, duplicates='drop'
-        )
-        
+        #Items_quantiles_uniform, Items_bins_uniform = pd.qcut(
+        #    self.output_dict['Items_uniform_raw'], q=5, labels=False, retbins=True, duplicates='drop'
+        #)
+
         self.output_dict['convex_hull_uniform'] = convex_hull_quantiles_uniform
         self.output_dict['convex_hull_bins_uniform'] = convex_hull_bins_uniform
         self.output_dict['cumArea_uniform'] = cumArea_quantiles_uniform
         self.output_dict['cumArea_bins_uniform'] = cumArea_bins_uniform
-        self.output_dict['Items_uniform'] = Items_quantiles_uniform
-        self.output_dict['Items_bins_uniform'] = Items_bins_uniform
+        #self.output_dict['Items_uniform'] = Items_quantiles_uniform
+        #self.output_dict['Items_bins_uniform'] = Items_bins_uniform
 
-        # === Zipfian features ===
+        # === Zipfian features (filtrate con lo stesso mask di uniform) ===
         indices_zipfian = self.dataset_zipfian_subset.indices
-        cumArea_vals_zipfian = [self.dataset_zipfian.cumArea_list[i] for i in indices_zipfian]
-        self.output_dict['FA_zipfian'] = [self.dataset_zipfian.FA_list[i] for i in indices_zipfian]
-        self.output_dict['CH_zipfian'] = [self.dataset_zipfian.CH_list[i] for i in indices_zipfian]
 
+        cumArea_vals_zipfian = [self.dataset_zipfian.cumArea_list[i] for i in indices_zipfian]
+        #fa_zipfian = [self.dataset_zipfian.FA_list[i] for i in indices_zipfian]
+        ch_zipfian = [self.dataset_zipfian.CH_list[i] for i in indices_zipfian]
+
+        # Applica lo stesso filtro basato su Items_uniform
+        filtered_indices_zipfian = np.array(indices_zipfian)
+
+        #self.output_dict['FA_zipfian'] = np.array(fa_zipfian)
+        self.output_dict['CH_zipfian'] = np.array(ch_zipfian)
+        self.output_dict['cumArea_zipfian_raw'] = np.array(cumArea_vals_zipfian)
+
+        # Binning delle feature Zipfian filtrate
         cumArea_quantiles_zipfian, cumArea_bins_zipfian = pd.qcut(
-            cumArea_vals_zipfian, q=10, labels=False, retbins=True, duplicates='drop'
+            self.output_dict['cumArea_zipfian_raw'], q=5, labels=False, retbins=True, duplicates='drop'
         )
+
         self.output_dict['cumArea_zipfian'] = cumArea_quantiles_zipfian
         self.output_dict['cumArea_bins_zipfian'] = cumArea_bins_zipfian
 
+
         return self.output_dict
-    
+
 
 
     def reconstruct_input(self, input_type="uniform"):
@@ -163,8 +183,10 @@ class Embedding_analysis:
         else:
             device = torch.device('cpu')
 
-        dataloader = self.val_dataloader_uniform 
+        dataloader = self.val_dataloader_uniform
         model = self.model_uniform if input_type == "uniform" else self.model_zipfian
+
+
 
         batch = next(iter(dataloader))
         inputs, _ = batch

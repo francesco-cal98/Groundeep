@@ -15,20 +15,22 @@ sys.path.append(current_dir) # Add current_dir if it contains other necessary mo
 
 # Import your classes
 from src.analyses.embedding_analysis import Embedding_analysis
-from src.analyses.visualizer_class import VisualizerWithLogging
+from src.analyses.visualizer_class_old import VisualizerWithLogging
 from src.utils.wandb_utils import log_reconstructions_to_wandb
 
 # === Configuration ===
+
+
 configs = {
     "uniform": {
-        "data_path": "/home/student/Desktop/Groundeep/circle_dataset_corr_tuned_v12",
-        "data_file": "circle_dataset_100x100_corr_tuned_v12.npz",
-        "network_dir": "/home/student/Desktop/Groundeep/networks/uniform/idbn_binary_v3"
+        "data_path": "/home/student/Desktop/Groundeep/stimuli_dataset_adaptive",
+        "data_file": "stimuli_dataset.npz",
+        "network_dir": "/home/student/Desktop/Groundeep/networks/uniform/dataset_cum_area_0"
     },
     "zipfian": {
-        "data_path": "/home/student/Desktop/Groundeep/circle_dataset_100x100",
-        "data_file": "binarized_data.npz",
-        "network_dir": "/home/student/Desktop/Groundeep/networks/zipfian/idbn_binary_V3"
+        "data_path": "/home/student/Desktop/Groundeep/stimuli_dataset_adaptive",
+        "data_file": "stimuli_dataset.npz",
+        "network_dir": "/home/student/Desktop/Groundeep/networks/zipfian/dataset_cum_area_0"
     }
 }
 
@@ -36,8 +38,12 @@ configs = {
 global_output_base_dir = "/home/student/Desktop/Groundeep/outputs/analysis_results/" 
 os.makedirs(global_output_base_dir, exist_ok=True)
 
+
 # === Init WandB ===
-run = wandb.init(project="groundeep-visualization")
+run = wandb.init(project="groundeep-visualization2")
+print("WANDB mode:", wandb.run.settings.mode)
+run.log({"debug/first": 1})
+
 
 # === Initialize Visualizer ONLY ONCE outside the loops ===
 # NON PASSARE embedding_analyzer qui!
@@ -77,6 +83,10 @@ for dist_name, cfg in configs.items():
         # Prepare data for plotting and analysis
         embeddings = np.array(output_dict.get(f'Z_{dist_name}', []), dtype=np.float64)
         
+        # normalization of embeddings
+        embeddings_mean = np.mean(embeddings, axis=0)
+        embeddings_std = np.std(embeddings, axis=0)
+        embeddings = (embeddings - embeddings_mean) / (embeddings_std + 1e-10)  # Adding a small constant to avoid division by zero
         features = {
             "N_list": np.array(output_dict.get(f'labels_{dist_name}', [])),
             "cumArea": np.array(output_dict.get(f'cumArea_{dist_name}', [])),
@@ -95,9 +105,9 @@ for dist_name, cfg in configs.items():
 
         if embeddings.shape[0] > 1: 
             emb_2d = visualizer.reduce_dimensions(embeddings, method='pca') 
-            correlations = visualizer.plot_2d_embedding_and_correlations(emb_2d, features, arch_name, dist_name, method_name="PCA")
+            correlations = visualizer.plot_2d_embedding_and_correlations(emb_2d, features, arch_name, dist_name, method_name="UMAP")
             
-            correlations = visualizer.plot_2d_embedding_and_correlations(emb_2d, features, arch_name, dist_name, method_name="PCA")
+            correlations = visualizer.plot_2d_embedding_and_correlations(emb_2d, features, arch_name, dist_name, method_name="UMAP")
             
             # --- INIZIO BLOCCO DI CODICE CORRETTO ---
             # Itera sulle chiavi e valori del dizionario 'correlations'
@@ -123,10 +133,18 @@ for dist_name, cfg in configs.items():
                 })
             # --- FINE BLOCCO DI CODICE CORRETTO ---
         # Passa embedding_analyzer a questi metodi!
-        visualizer.rsa_analysis(arch_name, dist_name, embedding_analyzer=embedding_analyzer, metric="cosine")
-        visualizer.mse_analysis(arch_name, embedding_analyzer=embedding_analyzer)
-        visualizer.afp_analysis(arch_name, embedding_analyzer=embedding_analyzer)
-        visualizer.ssim_analysis(arch_name, embedding_analyzer=embedding_analyzer)
+        visualizer.plot_pairwise_class_rdm( arch_name, dist_name, embedding_analyzer, feature="labels", metric="cosine")
+        visualizer.rsa_analysis(arch_name, dist_name, embedding_analyzer=embedding_analyzer)
+        
+        #visualizer.mse_analysis(arch_name, embedding_analyzer=embedding_analyzer)
+        #visualizer.afp_analysis(arch_name, embedding_analyzer=embedding_analyzer)
+        #visualizer.ssim_analysis(arch_name, embedding_analyzer=embedding_analyzer)
+        #visualizer.comprehensive_analysis(arch_name, embedding_analyzer=embedding_analyzer)
+        # === Nuove analisi sugli embeddings ===
+        #visualizer.linear_separability(embeddings, features["N_list"], arch_name, dist_name)
+        #visualizer.distance_monotonicity(embeddings,embedding_analyzer, arch_name, dist_name)
+        #visualizer.cluster_separability(embeddings, features["N_list"], arch_name, dist_name)
+
 
         # === Log reconstructions to WandB ===
         if original_inputs is not None and reconstructed is not None and len(original_inputs) > 0:
@@ -142,7 +160,7 @@ print("\n🔄 Generating combined RSA barplots (and boxplot)...")
 visualizer.plot_combined_rsa_barplots() 
 
 print("📝 Generating LaTeX report data...")
-visualizer.generate_latex_report_data()
+#visualizer.generate_latex_report_data()
 
 # Save the aggregated correlation dataframe
 if all_correlations:

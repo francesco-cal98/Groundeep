@@ -6,10 +6,10 @@ import numpy as np
 from embedding_analysis import Embedding_analysis
 
 # ==== Configuration ====
-data_path = "/home/student/Desktop/Groundeep/circle_dataset_100x100/"
-data_file = "circle_dataset_100x100_v2.npz"
-uniform_dir = "/home/student/Desktop/Groundeep/networks/uniform/idbn_new_dataset/"
-zipfian_dir = "/home/student/Desktop/Groundeep/networks/zipfian/idbn_new_dataset/"
+data_path = "/home/student/Desktop/Groundeep/stimuli_dataset_adaptive/"
+data_file = "stimuli_dataset.npz"
+uniform_dir = "/home/student/Desktop/Groundeep/networks/uniform/dataset_cum_area_0/"
+zipfian_dir = "/home/student/Desktop/Groundeep/networks/zipfian/idbn_new_dataset2/"
 output_dir = "/home/student/Desktop/Groundeep/outputs/distortion_heatmaps/cosine/"
 use_ratio = False  # 🔁 Set to False to use raw distances instead of ratios
 
