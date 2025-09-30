@@ -1,0 +1,29 @@
+# training_config.yaml
+
+# Parametri del modello e dell'algoritmo
+algorithm: "i" # Può essere "i" per iDBN o "g" per gDBN
+learning_rate: 0.15
+weight_penalty: 0.0001
+init_momentum: 0.7
+final_momentum: 0.97
+cd_k: 10 # CD-k (Contrastive Divergence steps)
+sparsity: false
+sparsity_factor: 0.05
+epochs: 200
+
+# Parametri del dataset e dei percorsi
+dataset_path: "/home/student/Desktop/Groundeep/stimuli_dataset_adaptive"
+dataset_name: "stimuli_dataset.npz"
+batch_size: 128
+num_workers: 1
+multimodal_flag: false
+
+# Parametri per il salvataggio
+save_path: "/home/student/Desktop/Groundeep/networks/uniform/idbn_new_dataset_60_epochs"
+save_name: "dbn_trained_uniform"
+
+# Architetture del modello (lista di architetture da testare)
+layer_sizes_list:
+  - [1500, 500]
+  - [1500, 1500]
+  - [1000, 500]

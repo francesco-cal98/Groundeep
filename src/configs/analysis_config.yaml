@@ -1,0 +1,19 @@
+# analysis_config.yaml
+
+# Modello e percorsi
+model_to_analyze:
+  - arch: "1500_500"
+    distribution: "uniform"
+    epochs: 60
+
+# Se volessi analizzare più modelli, basterebbe aggiungerli qui
+#  - arch: "1500_1500"
+#    distribution: "zipfian"
+#    epochs: 60
+
+# Parametri del dataset e dei percorsi per le analisi
+dataset_path: "/home/student/Desktop/Groundeep/stimuli_dataset_adaptive"
+dataset_name: "stimuli_dataset.npz"
+batch_size: 128
+num_workers: 1
+multimodal_flag: false

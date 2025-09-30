@@ -1,25 +1,50 @@
-# Ignora file Python compilati
+# Ignora file Python compilati in qualsiasi sottocartella
 *.pyc
-__pycache__/
+**/__pycache__/
 
-# Ignora cartelle specifiche
-.venv/
-node_modules/
+# Ignora cartelle specifiche in qualsiasi posizione
+**/.venv/
+**/node_modules/
 
-# Ignora file di configurazione locali
+# Ignora file di configurazione locali e log di sviluppo
 config.local.json
+**/training_tensors/
+**/logs/
+**/lightning_logs/
+**/.vscode/
 
-# Ignora file temporanei
+# Ignora file temporanei e di output del modello/analisi
 *.tmp
-training_tensors/
-
-*.mat 
+*.mat
 *.pkl
-logs/
-lightning_logs/
-.vscode/
-.*pt
-.*png
+*.pt
+*.npz
+*.png
+*.jpg
+*.pdf
+*.csv
+*.xlsx
+*.log
+*.out
+*.es2
+*.ebs2
+*.docx
+*.txt
+*.tex
+*.npy
+*.json
+*.wandb
+*.wndpos
+
+# Ignora le cartelle di log specifiche del tuo progetto
 logs-gdbn/
-src/notebooks/model_coefficients_results_5.xlsx
-.*npz
+logs-idbn/
+logs-imdbn/
+wandb/
+
+
+# Ignora i file di output specifici del tuo progetto
+**/model_coefficients_results_5.xlsx
+
+# Ignora le cartelle di output di Jupyter Notebook
+**/notebooks/
