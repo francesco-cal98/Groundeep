@@ -12,7 +12,7 @@ sparsity_factor: 0.05
 epochs: 200
 
 # Parametri del dataset e dei percorsi
-dataset_path: "/home/student/Desktop/Groundeep/stimuli_dataset_adaptive"
+dataset_path: "/home/student/Desktop/Groundeep/stimuli_dataset_adaptive_auto"
 dataset_name: "stimuli_dataset.npz"
 batch_size: 128
 num_workers: 1
