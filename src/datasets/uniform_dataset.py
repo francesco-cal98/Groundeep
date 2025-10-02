@@ -37,6 +37,7 @@ class UniformDataset(Dataset):
         self.cumArea_list = data['cumArea_list']
         #self.FA_list = data['FA_list']
         self.CH_list = data['CH_list']
+        self.density_list = data['density'] if 'density' in data else None
         #self.Items_list = data['item_size']
 
 

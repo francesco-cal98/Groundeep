@@ -46,6 +46,8 @@ def compute_val_embeddings_and_features(model) -> tuple[torch.Tensor, dict]:
     cum_area = model.features["Cumulative Area"].view(-1).cpu()
     chull    = model.features["Convex Hull"].view(-1).cpu()
     labels   = model.features["Labels"].view(-1).cpu()
+    density_feat = model.features.get("Density")
+    density = density_feat.view(-1).cpu() if density_feat is not None else None
 
     n = E.size(0)
     if cum_area.numel() != n or chull.numel() != n or labels.numel() != n:
@@ -54,7 +56,14 @@ def compute_val_embeddings_and_features(model) -> tuple[torch.Tensor, dict]:
             f"convex_hull={chull.numel()}, labels={labels.numel()}."
         )
 
+    if density is not None and density.numel() != n:
+        raise RuntimeError(
+            f"Dimension mismatch: embeddings={n}, density={density.numel()}."
+        )
+
     feats = {"cum_area": cum_area, "convex_hull": chull, "labels": labels}
+    if density is not None:
+        feats["density"] = density
     return E, feats
 
 
@@ -289,7 +298,11 @@ def log_linear_probe(
     E, feats = compute_val_embeddings_and_features(model)   # E: [N, D]
     E_np = E.numpy()
 
-    for mkey in ["cum_area", "convex_hull", "labels"]:
+    probe_targets = ["cum_area", "convex_hull", "labels"]
+    if "density" in feats:
+        probe_targets.append("density")
+
+    for mkey in probe_targets:
         # 1) target binned (stesso numero di livelli) + nomi dei bin
         y, n_classes, edges, bin_names = _prepare_targets(feats, mkey, n_bins=n_bins)
 

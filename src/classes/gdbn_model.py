@@ -13,7 +13,10 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from io import BytesIO
 from PIL import Image
-from src.utils.wandb_utils import plot_2d_embedding_and_correlations
+from src.utils.wandb_utils import (
+    plot_2d_embedding_and_correlations,
+    plot_3d_embedding_and_correlations,
+)
 import copy
 import umap
 
@@ -282,15 +285,20 @@ class iDBN:
             self.labels = val_labels
             self.cumArea_vals = [val_loader.dataset.dataset.cumArea_list[i] for i in indices]
             self.convex_hull = [val_loader.dataset.dataset.CH_list[i] for i in indices]
+            density_source = getattr(val_loader.dataset.dataset, "density_list", None)
+            self.density_vals = [density_source[i] for i in indices] if density_source is not None else None
 
             self.features = {
                 "Cumulative Area": torch.tensor(self.cumArea_vals, dtype=torch.float),
                 "Convex Hull": torch.tensor(self.convex_hull, dtype=torch.float),
                 "Labels": self.labels,
             }
+            if self.density_vals is not None:
+                self.features["Density"] = torch.tensor(self.density_vals, dtype=torch.float)
         else:
             self.validation_images = None
             self.features = None
+            self.density_vals = None
 
         self.arch_str = '-'.join(str(size) for size in layer_sizes)
         self.arch_dir = os.path.join(log_root, f"architecture_{self.arch_str}")
@@ -359,8 +367,8 @@ class iDBN:
                     if final_embedding.shape[0] > 1 and final_embedding.shape[1] > 2:
                         n_neighbors_umap = min(final_embedding.shape[0] - 1, 15)
                         Umap = umap.UMAP(n_components=2, random_state=42, n_neighbors=n_neighbors_umap)
-                        pca = PCA(n_components=2)
-                        emb_2d_pca = pca.fit_transform(final_embedding)
+                        pca2 = PCA(n_components=2)
+                        emb_2d_pca = pca2.fit_transform(final_embedding)
                         plot_2d_embedding_and_correlations(
                             emb_2d=emb_2d_pca,
                             features=self.features,
@@ -369,6 +377,17 @@ class iDBN:
                             method_name="pca",
                             wandb_run=self.wandb_run,
                         )
+                        if final_embedding.shape[1] >= 3 and final_embedding.shape[0] >= 3:
+                            pca3 = PCA(n_components=3)
+                            emb_3d_pca = pca3.fit_transform(final_embedding)
+                            plot_3d_embedding_and_correlations(
+                                emb_3d=emb_3d_pca,
+                                features=self.features,
+                                arch_name=self.arch_str,
+                                dist_name="validation",
+                                method_name="pca",
+                                wandb_run=self.wandb_run,
+                            )
                 except Exception as e:
                     if self.wandb_run:
                         self.wandb_run.log({"warn/pca_logging_error": str(e)})
@@ -827,4 +846,3 @@ def plot_bar(values):
     ax.bar(range(len(values)), values)
     ax.set_ylim(0, 1)
     return fig
-

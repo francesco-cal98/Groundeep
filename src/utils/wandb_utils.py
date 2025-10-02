@@ -1,7 +1,9 @@
+import math
 import wandb
 import os
 import torchvision.utils as vutils
 import matplotlib.pyplot as plt 
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  # Needed for 3D projection registration
 import torch
 import numpy as np
 from scipy.stats import spearmanr
@@ -107,3 +109,64 @@ def plot_2d_embedding_and_correlations(emb_2d, features, arch_name, dist_name, m
     plt.close()
     return correlations
 
+
+def plot_3d_embedding_and_correlations(emb_3d, features, arch_name, dist_name, method_name, wandb_run):
+    """Generate 3D scatter plots for each feature and log Spearman correlations."""
+    print(f"  Generating 3D embedding plot for {arch_name}/{dist_name} using {method_name}...")
+
+    if emb_3d.shape[0] == 0 or emb_3d.shape[1] != 3:
+        print(f"    Skipping 3D embedding plot for {arch_name}/{dist_name}: Invalid 3D embeddings.")
+        return {}
+
+    correlations = {}
+    n_features = len(features)
+
+    n_cols = 3
+    n_rows = int(math.ceil(n_features / n_cols)) if n_features > 0 else 1
+
+    fig = plt.figure(figsize=(5 * n_cols, 4 * n_rows))
+
+    for idx, (feat_name, values) in enumerate(features.items()):
+        ax = fig.add_subplot(n_rows, n_cols, idx + 1, projection='3d')
+
+        if len(values) != emb_3d.shape[0] or len(values) < 2:
+            print(f"    Feature '{feat_name}' length mismatch or insufficient data for embeddings. Skipping plot for this feature.")
+            correlations[f"{feat_name}_dim1"] = np.nan
+            correlations[f"{feat_name}_dim2"] = np.nan
+            correlations[f"{feat_name}_dim3"] = np.nan
+            ax.axis('off')
+            continue
+
+        rho_dim1, _ = spearmanr(emb_3d[:, 0], values)
+        rho_dim2, _ = spearmanr(emb_3d[:, 1], values)
+        rho_dim3, _ = spearmanr(emb_3d[:, 2], values)
+        correlations[f"{feat_name}_dim1"] = rho_dim1
+        correlations[f"{feat_name}_dim2"] = rho_dim2
+        correlations[f"{feat_name}_dim3"] = rho_dim3
+
+        if feat_name == "Labels":
+            color_values = np.log(values)
+        else:
+            color_values = values
+
+        sc = ax.scatter(emb_3d[:, 0], emb_3d[:, 1], emb_3d[:, 2], c=color_values, cmap='viridis', s=30, alpha=0.8)
+        ax.set_title(
+            f"{feat_name}\nDim1={rho_dim1:.2f}, Dim2={rho_dim2:.2f}, Dim3={rho_dim3:.2f}"
+        )
+        ax.set_xlabel(f"{method_name}-1")
+        ax.set_ylabel(f"{method_name}-2")
+        ax.set_zlabel(f"{method_name}-3")
+        fig.colorbar(sc, ax=ax, shrink=0.6, aspect=12, pad=0.1, label=feat_name)
+
+    # Hide unused subplots
+    total_plots = n_rows * n_cols
+    for idx in range(n_features, total_plots):
+        ax = fig.add_subplot(n_rows, n_cols, idx + 1, projection='3d')
+        ax.axis('off')
+
+    plt.suptitle(f"{method_name} 3D Embedding for {arch_name} ({dist_name})", fontsize=16)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+    wandb_run.log({f"embeddings/{dist_name}/{arch_name}/{method_name}_3d_embedding": wandb.Image(fig)})
+    plt.close(fig)
+    return correlations
