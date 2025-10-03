@@ -17,7 +17,7 @@ except Exception:
 # Embeddings + features
 # -------------------------
 @torch.no_grad()
-def compute_val_embeddings_and_features(model) -> tuple[torch.Tensor, dict]:
+def compute_val_embeddings_and_features(model, upto_layer: int | None = None) -> tuple[torch.Tensor, dict]:
     """
     Calcola:
       - E: tensor [N, D] con gli embeddings del validation set (NO shuffle nel val_loader!)
@@ -39,7 +39,10 @@ def compute_val_embeddings_and_features(model) -> tuple[torch.Tensor, dict]:
     for batch_data, batch_labels in model.val_loader:
         x = (batch_data.to(model.device) if not model.text_flag else batch_labels.to(model.device))
         x = x.view(x.size(0), -1).float()
-        z = model.represent(x)  # [B, D]
+        if upto_layer is None:
+            z = model.represent(x)  # [B, D]
+        else:
+            z = model.represent(x, upto_layer=upto_layer)
         embeds.append(z.detach().cpu())
     E = torch.cat(embeds, dim=0)  # [N, D]
 
@@ -284,6 +287,8 @@ def log_linear_probe(
     patience: int = 20,
     min_delta: float = 0.0,
     save_csv: bool = True,
+    upto_layer: int | None = None,
+    layer_tag: str | None = None,
 ):
     """
     Linear probe su: 'cum_area', 'convex_hull', 'labels' — tutte binnate in n_bins.
@@ -295,7 +300,7 @@ def log_linear_probe(
         * (opzionale) edges dei bin
     - Salva la confusion matrix anche in CSV (stile Excel) in model.arch_dir.
     """
-    E, feats = compute_val_embeddings_and_features(model)   # E: [N, D]
+    E, feats = compute_val_embeddings_and_features(model, upto_layer=upto_layer)   # E: [N, D]
     E_np = E.numpy()
 
     probe_targets = ["cum_area", "convex_hull", "labels"]
@@ -305,11 +310,12 @@ def log_linear_probe(
     for mkey in probe_targets:
         # 1) target binned (stesso numero di livelli) + nomi dei bin
         y, n_classes, edges, bin_names = _prepare_targets(feats, mkey, n_bins=n_bins)
+        metric_name = f"{layer_tag}/{mkey}" if layer_tag else mkey
 
         # 2) stratified split
         train_idx, test_idx = stratified_split(y, test_size=test_size, rng_seed=rng_seed)
         if len(train_idx) == 0 or len(test_idx) == 0:
-            _log_accuracy_wandb(model.wandb_run, f"{mkey}/warn_empty_split", 0.0, epoch)
+            _log_accuracy_wandb(model.wandb_run, f"{metric_name}/warn_empty_split", 0.0, epoch)
             continue
 
         # 3) train & eval (full-batch + early stopping)
@@ -331,12 +337,13 @@ def log_linear_probe(
         df = _confusion_df(y_true, y_pred, n_classes, bin_names)
 
         # 5) Log: SOLO accuracy finale + tabella confusion + (edges opzionali) + CSV locale
-        _log_accuracy_wandb(model.wandb_run, mkey, acc, epoch)
-        _log_confusion_table_wandb(model.wandb_run, df, mkey, epoch)
-        _log_bin_edges_wandb(model.wandb_run, mkey, edges, epoch)
+        _log_accuracy_wandb(model.wandb_run, metric_name, acc, epoch)
+        _log_confusion_table_wandb(model.wandb_run, df, metric_name, epoch)
+        _log_bin_edges_wandb(model.wandb_run, metric_name, edges, epoch)
 
         if save_csv:
-            csv_path = _save_confusion_csv(df, model, mkey, epoch)
+            csv_metric_name = metric_name.replace('/', '_')
+            csv_path = _save_confusion_csv(df, model, csv_metric_name, epoch)
             # (facoltativo) potresti anche loggare il path su W&B:
             if model.wandb_run and wandb is not None:
-                model.wandb_run.log({f"probe/{mkey}/confusion_csv_path": csv_path, "epoch": epoch})
+                model.wandb_run.log({f"probe/{metric_name}/confusion_csv_path": csv_path, "epoch": epoch})

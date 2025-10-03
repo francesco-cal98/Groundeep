@@ -12,14 +12,14 @@ sparsity_factor: 0.05
 epochs: 200
 
 # Parametri del dataset e dei percorsi
-dataset_path: "/home/student/Desktop/Groundeep/stimuli_dataset_adaptive_auto"
+dataset_path: "/home/student/Desktop/Groundeep/stimuli_dataset_adaptive"
 dataset_name: "stimuli_dataset.npz"
 batch_size: 128
 num_workers: 1
 multimodal_flag: false
 
 # Parametri per il salvataggio
-save_path: "/home/student/Desktop/Groundeep/networks/uniform/idbn_new_dataset_60_epochs"
+save_path: "/home/student/Desktop/Groundeep/networks/uniform/idbn_new_dataset_200_epochs"
 save_name: "dbn_trained_uniform"
 
 # Architetture del modello (lista di architetture da testare)

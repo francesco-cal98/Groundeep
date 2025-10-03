@@ -12,6 +12,7 @@ from sklearn.metrics import pairwise_distances
 from statsmodels.stats.multitest import multipletests
 import pickle
 import sys
+import torch
 
 # === PATH SETUP ===
 current_dir = os.getcwd()
@@ -149,21 +150,43 @@ class RepresentationalAnalysis:
         plt.close()
         print(f"Pairwise class RDM saved: {fpath}")
 
+    def _tensor_to_numpy(self, value):
+        """Utility: convert tensors/lists to numpy without side effects."""
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu().numpy()
+        if isinstance(value, np.ndarray):
+            return value
+        return np.asarray(value)
+
     def run_all_analyses(self, data, arch_name, dist_name):
         """Metodo per eseguire tutte le analisi."""
         print(f"Running analyses for {arch_name} - {dist_name}...")
-        
-        embeddings = self.model.represent(data.val_batch)
-        features = self.model.features
-        
+
+        val_batch = getattr(data, "val_batch", None)
+        if val_batch is None:
+            raise AttributeError("Model passed to RepresentationalAnalysis must expose a 'val_batch' attribute.")
+
+        embeddings = self.model.represent(val_batch)
+        embeddings_np = embeddings.detach().cpu().numpy()
+
+        raw_features = getattr(self.model, "features", None) or {}
+        features = {key: self._tensor_to_numpy(val) for key, val in raw_features.items()}
+
+        labels = features.get("Labels")
+        if labels is not None and labels.ndim > 1:
+            labels = labels.argmax(axis=1) + 1
+            features["Labels"] = labels
+
         self.rsa_analysis(
-            embeddings=embeddings.detach().cpu().numpy(),
+            embeddings=embeddings_np,
             features=features,
             dist_name=dist_name,
             arch_name=arch_name
         )
         self.plot_pairwise_class_rdm(
-            embeddings=embeddings.detach().cpu().numpy(),
+            embeddings=embeddings_np,
             features=features,
             dist_name=dist_name,
             arch_name=arch_name

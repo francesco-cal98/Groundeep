@@ -5,6 +5,16 @@ model_to_analyze:
   - arch: "1500_500"
     distribution: "uniform"
     epochs: 60
+    model_type: "idbn"
+    model_path: "/home/student/Desktop/Groundeep/networks/uniform/idbn_new_dataset_60_epochs_i_dbn_trained_uniform_1500_500.pkl"
+
+  - arch: "IMG10000-1500-500_TXT32-500-500_JOINT1000"
+    distribution: "zipfian"
+    model_type: "imdbn"
+    model_path: "/home/student/Desktop/Groundeep/networks/zipfian/imdbn/imdbn_trained_zipfian_IMG10000-1500-500_TXT32-500-500_JOINT1000.pkl"
+    multimodal_flag: true
+    dataset_path: "/home/student/Desktop/Groundeep/stimuli_dataset_adaptive"
+    dataset_name: "stimuli_dataset.npz"
 
 # Se volessi analizzare più modelli, basterebbe aggiungerli qui
 #  - arch: "1500_1500"
@@ -17,3 +27,4 @@ dataset_name: "stimuli_dataset.npz"
 batch_size: 128
 num_workers: 1
 multimodal_flag: false
+networks_root: "/home/student/Desktop/Groundeep/networks"

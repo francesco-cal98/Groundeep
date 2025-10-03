@@ -282,19 +282,38 @@ class iDBN:
             self.validation_images = (self.val_batch[:5].to(self.device) if not text_flag else val_labels[:5].to(self.device))
 
             indices = val_loader.dataset.indices
-            self.labels = val_labels
-            self.cumArea_vals = [val_loader.dataset.dataset.cumArea_list[i] for i in indices]
-            self.convex_hull = [val_loader.dataset.dataset.CH_list[i] for i in indices]
-            density_source = getattr(val_loader.dataset.dataset, "density_list", None)
+            base_dataset = val_loader.dataset.dataset
+
+            # Cache original labels (could be one-hot for multimodal use-cases)
+            self.val_labels_raw = val_labels
+
+            # Convert to numeric labels using the underlying dataset to ensure consistency
+            numeric_labels = torch.tensor(
+                [base_dataset.labels[i] for i in indices],
+                dtype=torch.float32,
+            )
+
+            self.labels = numeric_labels
+            self.cumArea_vals = [base_dataset.cumArea_list[i] for i in indices]
+            self.convex_hull = [base_dataset.CH_list[i] for i in indices]
+            density_source = getattr(base_dataset, "density_list", None)
             self.density_vals = [density_source[i] for i in indices] if density_source is not None else None
 
+            # When we operate in multimodal mode keep a copy of one-hot labels for downstream needs
+            if isinstance(val_labels, torch.Tensor) and val_labels.dim() > 1:
+                self.labels_one_hot = val_labels.detach().clone()
+            else:
+                self.labels_one_hot = torch.nn.functional.one_hot(
+                    (numeric_labels.long() - 1).clamp(min=0), num_classes=32
+                ).float()
+
             self.features = {
-                "Cumulative Area": torch.tensor(self.cumArea_vals, dtype=torch.float),
-                "Convex Hull": torch.tensor(self.convex_hull, dtype=torch.float),
-                "Labels": self.labels,
+                "Cumulative Area": torch.tensor(self.cumArea_vals, dtype=torch.float32),
+                "Convex Hull": torch.tensor(self.convex_hull, dtype=torch.float32),
+                "Labels": numeric_labels,
             }
             if self.density_vals is not None:
-                self.features["Density"] = torch.tensor(self.density_vals, dtype=torch.float)
+                self.features["Density"] = torch.tensor(self.density_vals, dtype=torch.float32)
         else:
             self.validation_images = None
             self.features = None
@@ -303,6 +322,8 @@ class iDBN:
         self.arch_str = '-'.join(str(size) for size in layer_sizes)
         self.arch_dir = os.path.join(log_root, f"architecture_{self.arch_str}")
         os.makedirs(self.arch_dir, exist_ok=True)
+
+        self._features_numpy_cache = None
 
         self.cd_k = int(self.params.get("CD", 1))
         self.sparsity = self.params.get("SPARSITY", False)
@@ -359,46 +380,27 @@ class iDBN:
                     except Exception:
                         pass
 
-            # PCA logging (se usi già plot_2d_embedding_and_correlations)
+            # PCA logging per layer (first & top, when available)
             if self.wandb_run and self.features and epoch % log_every_pca == 0:
-                try:
-                    with torch.no_grad():
-                        final_embedding = self.represent(self.val_batch).detach().cpu()
-                    if final_embedding.shape[0] > 1 and final_embedding.shape[1] > 2:
-                        n_neighbors_umap = min(final_embedding.shape[0] - 1, 15)
-                        Umap = umap.UMAP(n_components=2, random_state=42, n_neighbors=n_neighbors_umap)
-                        pca2 = PCA(n_components=2)
-                        emb_2d_pca = pca2.fit_transform(final_embedding)
-                        plot_2d_embedding_and_correlations(
-                            emb_2d=emb_2d_pca,
-                            features=self.features,
-                            arch_name=self.arch_str,
-                            dist_name="validation",
-                            method_name="pca",
-                            wandb_run=self.wandb_run,
-                        )
-                        if final_embedding.shape[1] >= 3 and final_embedding.shape[0] >= 3:
-                            pca3 = PCA(n_components=3)
-                            emb_3d_pca = pca3.fit_transform(final_embedding)
-                            plot_3d_embedding_and_correlations(
-                                emb_3d=emb_3d_pca,
-                                features=self.features,
-                                arch_name=self.arch_str,
-                                dist_name="validation",
-                                method_name="pca",
-                                wandb_run=self.wandb_run,
-                            )
-                except Exception as e:
-                    if self.wandb_run:
-                        self.wandb_run.log({"warn/pca_logging_error": str(e)})
+                for layer_idx in self._layers_to_monitor():
+                    layer_tag = self._layer_tag(layer_idx)
+                    self._log_layer_embeddings(layer_idx, layer_tag)
 
-            # 🔔 Linear probe logging via utils
+            # 🔔 Linear probe logging via utils (per monitored layer)
             if self.wandb_run and self.features and self.val_loader is not None and epoch % log_every_probe == 0:
-                try:
-                    log_linear_probe(self, epoch=epoch, n_bins=5, test_size=0.2, steps=1000, lr=1e-2, patience=20, min_delta=0.0)
-                except Exception as e:
-                    if self.wandb_run:
-                        self.wandb_run.log({"warn/probe_logging_error": str(e)})
+                for layer_idx in self._layers_to_monitor():
+                    layer_tag = self._layer_tag(layer_idx)
+                    self._log_linear_probe_for_layer(
+                        epoch,
+                        layer_idx,
+                        layer_tag,
+                        n_bins=5,
+                        test_size=0.2,
+                        steps=1000,
+                        lr=1e-2,
+                        patience=20,
+                        min_delta=0.0,
+                    )
 
             torch.cuda.empty_cache()
 
@@ -422,11 +424,116 @@ class iDBN:
         self.layers = new_layers
 
     @torch.no_grad()
-    def represent(self, x: torch.Tensor) -> torch.Tensor:
+    def represent(self, x: torch.Tensor, upto_layer: int | None = None) -> torch.Tensor:
         v = x.view(x.size(0), -1).float().to(self.device)
-        for rbm in self.layers:
-            v = rbm.forward(v)
+
+        if upto_layer is None:
+            target_layers = len(self.layers)
+        else:
+            if upto_layer <= 0:
+                return v
+            target_layers = min(len(self.layers), upto_layer)
+
+        for idx in range(target_layers):
+            v = self.layers[idx].forward(v)
         return v
+
+    def _layers_to_monitor(self) -> list[int]:
+        layers = {len(self.layers)}
+        if not self.text_flag and len(self.layers) > 1:
+            layers.add(1)
+        return sorted(layers)
+
+    def _layer_tag(self, layer_idx: int) -> str:
+        return f"layer{layer_idx}"
+
+    def _get_features_numpy(self) -> dict:
+        if self.features is None:
+            return {}
+        if self._features_numpy_cache is None:
+            self._features_numpy_cache = {
+                key: (value.detach().cpu().numpy() if isinstance(value, torch.Tensor) else np.asarray(value))
+                for key, value in self.features.items()
+            }
+        return self._features_numpy_cache
+
+    def _validation_source_batch(self) -> torch.Tensor | None:
+        if self.text_flag:
+            return getattr(self, "val_labels_raw", None)
+        return getattr(self, "val_batch", None)
+
+    def _log_layer_embeddings(self, upto_layer: int, layer_tag: str) -> None:
+        if not self.wandb_run or self.features is None:
+            return
+
+        source_batch = self._validation_source_batch()
+        if source_batch is None:
+            return
+
+        try:
+            with torch.no_grad():
+                embeddings = self.represent(source_batch, upto_layer=upto_layer).detach().cpu()
+            if embeddings.shape[0] <= 1 or embeddings.shape[1] <= 1:
+                return
+
+            emb_np = embeddings.numpy()
+            feature_arrays = self._get_features_numpy()
+            arch_label = f"{self.arch_str}_{layer_tag}"
+
+            pca2 = PCA(n_components=2)
+            emb_2d_pca = pca2.fit_transform(emb_np)
+            plot_2d_embedding_and_correlations(
+                emb_2d=emb_2d_pca,
+                features=feature_arrays,
+                arch_name=arch_label,
+                dist_name="validation",
+                method_name="pca",
+                wandb_run=self.wandb_run,
+            )
+
+            if embeddings.shape[1] >= 3 and embeddings.shape[0] >= 3:
+                pca3 = PCA(n_components=3)
+                emb_3d_pca = pca3.fit_transform(emb_np)
+                plot_3d_embedding_and_correlations(
+                    emb_3d=emb_3d_pca,
+                    features=feature_arrays,
+                    arch_name=arch_label,
+                    dist_name="validation",
+                    method_name="pca",
+                    wandb_run=self.wandb_run,
+                )
+        except Exception as e:
+            if self.wandb_run:
+                self.wandb_run.log({f"warn/pca_logging_error_{layer_tag}": str(e)})
+
+    def _log_linear_probe_for_layer(
+        self,
+        epoch: int,
+        layer_idx: int,
+        layer_tag: str,
+        n_bins: int = 5,
+        test_size: float = 0.2,
+        steps: int = 1000,
+        lr: float = 1e-2,
+        patience: int = 20,
+        min_delta: float = 0.0,
+    ) -> None:
+        try:
+            log_linear_probe(
+                self,
+                epoch=epoch,
+                n_bins=n_bins,
+                test_size=test_size,
+                steps=steps,
+                lr=lr,
+                patience=patience,
+                min_delta=min_delta,
+                upto_layer=layer_idx,
+                layer_tag=layer_tag,
+            )
+        except Exception as e:
+            if self.wandb_run:
+                self.wandb_run.log({f"warn/probe_logging_error_{layer_tag}": str(e)})
 
     @torch.no_grad()
     def reconstruct(self, x: torch.Tensor) -> torch.Tensor:
@@ -461,11 +568,14 @@ class iDBN:
 # -----------------------
 class iMDBN(nn.Module):
     def __init__(self, layer_sizes_img, layer_sizes_txt, joint_layer_size, params,
-                 dataloader, val_loader, device, log_root="logs-imdbn",num_labels =32, embedding_dim=64):
+                 dataloader, val_loader, device, log_root="logs-imdbn",num_labels =32, embedding_dim=64,
+                 wandb_run=None):
         super(iMDBN, self).__init__()
         self.params = params
         self.device = device
         self.dataloader = dataloader
+        self.val_loader = val_loader
+        self.wandb_run = wandb_run
 
         self.num_labels = num_labels
         self.embedding_dim = embedding_dim
@@ -478,6 +588,7 @@ class iMDBN(nn.Module):
         val_batch, val_labels = next(iter(val_loader))
         self.validation_images = val_batch[:5].to(self.device)
         self.validation_labels = val_labels[:5].to(self.device)
+        self.val_batch = (val_batch, val_labels)
 
         self.arch_str = f"IMG{'-'.join(map(str,layer_sizes_img))}_TXT{'-'.join(map(str,layer_sizes_txt))}_JOINT{joint_layer_size}"
         self.arch_dir = os.path.join(log_root, f"architecture_{self.arch_str}")
@@ -486,11 +597,13 @@ class iMDBN(nn.Module):
         # Unimodal iDBNs (these manage their own RBMs)
         self.image_idbn = iDBN(layer_sizes=layer_sizes_img, params=params,
                                dataloader=self.dataloader, val_loader=val_loader,
-                               device=device, log_root=log_root, text_flag=False)
+                               device=device, log_root=log_root, text_flag=False,
+                               wandb_run=wandb_run)
 
         self.text_idbn = iDBN(layer_sizes=[self.num_labels] + layer_sizes_txt[1:], params=params,
                               dataloader=self.dataloader, val_loader=val_loader,
-                              device=device, log_root=log_root, text_flag=True)
+                              device=device, log_root=log_root, text_flag=True,
+                              wandb_run=wandb_run)
 
         # Joint RBM on concatenated top-level reps
         joint_rbm_visible_size = layer_sizes_img[-1] + layer_sizes_txt[-1]
@@ -508,6 +621,48 @@ class iMDBN(nn.Module):
         # supervised head from joint hidden -> predict N (regression)
         self.supervised_head = nn.Linear(joint_layer_size, 1).to(self.device)
         self.sup_optimizer = torch.optim.Adam(self.supervised_head.parameters(), lr=1e-3)
+
+        # Cache dataset-driven features for downstream analyses (mirrors iDBN behaviour)
+        indices = val_loader.dataset.indices
+        base_dataset = val_loader.dataset.dataset
+
+        numeric_labels = torch.tensor(
+            [base_dataset.labels[i] for i in indices], dtype=torch.float32
+        )
+        self.val_labels_numeric = numeric_labels
+
+        self.features = {
+            "Cumulative Area": torch.tensor(
+                [base_dataset.cumArea_list[i] for i in indices], dtype=torch.float32
+            ),
+            "Convex Hull": torch.tensor(
+                [base_dataset.CH_list[i] for i in indices], dtype=torch.float32
+            ),
+            "Labels": numeric_labels,
+        }
+
+        density_source = getattr(base_dataset, "density_list", None)
+        if density_source is not None:
+            self.features["Density"] = torch.tensor(
+                [density_source[i] for i in indices], dtype=torch.float32
+            )
+
+    @torch.no_grad()
+    def represent(self, batch):
+        """Return the joint hidden representation given (images, one-hot labels)."""
+        if isinstance(batch, (tuple, list)):
+            img_data, label_data = batch
+        else:
+            raise ValueError("Expected batch to be a tuple (images, labels) for multimodal represent().")
+
+        img_data = img_data.to(self.device).view(img_data.size(0), -1).float()
+        label_data = label_data.to(self.device).float()
+
+        img_rep = self.image_idbn.represent(img_data)
+        txt_rep = self.text_idbn.represent(label_data)
+
+        joint_input = torch.cat((img_rep, txt_rep), dim=1)
+        return self.joint_rbm.forward(joint_input)
 
     # -----------------
     def forward(self, img_data, labels):
@@ -575,7 +730,7 @@ class iMDBN(nn.Module):
 
 
     # -----------------
-    def train_joint(self, epochs, run_id=0, w_rec=1.0, w_sup=1.0):
+    def train_joint(self, epochs, run_id=0, w_rec=1.0, w_sup=1.0, log_every_pca=10):
         """
         Train joint RBM (via CD inside RBM.train_epoch) and also train a supervised
         head that predicts N from joint hidden probabilities.
@@ -665,6 +820,39 @@ class iMDBN(nn.Module):
             writer.add_scalar("JointRBM/sup_loss", mean_sup, epoch)
             #self.log_joint_cosine_similarity(writer, epoch)
             self.log_joint_diagnostics(writer, epoch, num_batches=5)
+
+            # PCA logging for multimodal joint representations
+            if self.wandb_run and self.features and epoch % log_every_pca == 0:
+                try:
+                    with torch.no_grad():
+                        embeddings = self.represent(self.val_batch).detach().cpu()
+                    if embeddings.shape[0] > 1 and embeddings.shape[1] > 2:
+                        n_neighbors_umap = min(embeddings.shape[0] - 1, 15)
+                        umap.UMAP(n_components=2, random_state=42, n_neighbors=n_neighbors_umap)
+                        pca2 = PCA(n_components=2)
+                        emb_2d_pca = pca2.fit_transform(embeddings)
+                        plot_2d_embedding_and_correlations(
+                            emb_2d=emb_2d_pca,
+                            features=self.features,
+                            arch_name=self.arch_str,
+                            dist_name="validation",
+                            method_name="pca",
+                            wandb_run=self.wandb_run,
+                        )
+                        if embeddings.shape[1] >= 3 and embeddings.shape[0] >= 3:
+                            pca3 = PCA(n_components=3)
+                            emb_3d_pca = pca3.fit_transform(embeddings)
+                            plot_3d_embedding_and_correlations(
+                                emb_3d=emb_3d_pca,
+                                features=self.features,
+                                arch_name=self.arch_str,
+                                dist_name="validation",
+                                method_name="pca",
+                                wandb_run=self.wandb_run,
+                            )
+                except Exception as e:
+                    if self.wandb_run:
+                        self.wandb_run.log({"warn/imdbn_pca_logging_error": str(e)})
 
 
 

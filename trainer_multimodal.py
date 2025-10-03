@@ -1,6 +1,7 @@
 from gdbn_model import iMDBN
 import torch
 import os
+import wandb
 from src.datasets.uniform_dataset import create_dataloaders_uniform
 
 
@@ -17,7 +18,10 @@ def main():
         "EPOCHS TEXT":10,
         "EPOCHS JOINT": 200,
         "SAVE_PATH": "/home/student/Desktop/Groundeep/networks/zipfian/imdbn",
-        "SAVE_NAME": "imdbn_trained_zipfian"
+        "SAVE_NAME": "imdbn_trained_zipfian",
+        "LOG_EVERY_PCA": 10,
+        "ENABLE_WANDB": True,
+        "WANDB_PROJECT": "groundeep-diagnostics-multimodal",
     }
 
     # Architetture
@@ -44,9 +48,14 @@ def main():
     )
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
+    wandb_run = None
+    if params.get("ENABLE_WANDB", False):
+        wandb_run = wandb.init(project=params.get("WANDB_PROJECT", "groundeep-diagnostics"),
+                                config=params)
+
     # Istanzia il modello multimodale
     imdbn = iMDBN(layer_sizes_img, layer_sizes_txt, joint_layer_size,
-                  params, train_loader, val_loader, device)
+                  params, train_loader, val_loader, device, wandb_run=wandb_run)
 
     # 1️⃣ Allena iDBN immagine
     print("Training image iDBN...")
@@ -58,11 +67,15 @@ def main():
 
     # 3️⃣ Allena RBM congiunto
     print("Training joint RBM...")
-    imdbn.train_joint(epochs=params["EPOCHS JOINT"])
+    imdbn.train_joint(epochs=params["EPOCHS JOINT"],
+                      log_every_pca=params.get("LOG_EVERY_PCA", 10))
 
     # Salva modello completo
     imdbn.save_model(save_path)
     print(f"✅ Saved trained multimodal DBN to {save_path}")
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":
