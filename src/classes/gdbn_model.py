@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from io import BytesIO
 from PIL import Image
+import wandb
 from src.utils.wandb_utils import (
     plot_2d_embedding_and_correlations,
     plot_3d_embedding_and_correlations,
@@ -33,7 +34,7 @@ sys.path.append(current_dir) # Add current_dir if it contains other necessary mo
 
 
 # importa il tuo modulo utils
-from src.utils.probe_utils import log_linear_probe  # <— qui l'orchestratore
+from src.utils.probe_utils import log_linear_probe, log_joint_linear_probe  # <— qui l'orchestratore
 
 
 
@@ -566,9 +567,149 @@ class iDBN:
 # -----------------------
 # Multimodal iMDBN (joint RBM + supervised head + cross-rec)
 # -----------------------
+
+class TextRBMEncoder:
+    def __init__(self, num_visible, num_hidden, params, dataloader, val_loader, device,
+                 positional_dim=0, log_root="logs-text-rbm", wandb_run=None):
+        self.device = device
+        self.params = params
+        self.dataloader = dataloader
+        self.val_loader = val_loader
+        self.wandb_run = wandb_run
+        self.num_labels = params.get("NUM_LABELS", 32)
+        self.positional_dim = positional_dim
+        self.feature_dim = num_visible
+
+        if self.positional_dim > 0 and self.feature_dim != self.num_labels + self.positional_dim:
+            raise ValueError(
+                f"TextRBMEncoder expects feature_dim = num_labels + positional_dim; got {self.feature_dim} vs {self.num_labels + self.positional_dim}"
+            )
+
+        self.positional_table = None
+        if self.positional_dim > 0:
+            self.positional_table = self._build_positional_table(self.num_labels, self.positional_dim)
+
+        text_lr = params.get('TEXT_LEARNING_RATE', params['LEARNING_RATE'])
+        self.rbm = RBM(
+            num_visible=self.feature_dim,
+            num_hidden=num_hidden,
+            learning_rate=text_lr,
+            weight_decay=params['WEIGHT_PENALTY'],
+            momentum=params['INIT_MOMENTUM'],
+            dynamic_lr=params['LEARNING_RATE_DYNAMIC'],
+            final_momentum=params['FINAL_MOMENTUM'],
+        )
+        self.rbm.to(self.device)
+        self.layers = [self.rbm]
+
+        self.arch_str = f"{self.feature_dim}-{num_hidden}"
+        self.arch_dir = os.path.join(log_root, f"text_rbm_{self.arch_str}")
+        os.makedirs(self.arch_dir, exist_ok=True)
+
+        if val_loader is not None:
+            _, val_labels = next(iter(val_loader))
+            self.val_samples = val_labels[:5].to(self.device)
+        else:
+            self.val_samples = None
+
+    def train(self, epochs, run_id=0):
+        writer = SummaryWriter(log_dir=os.path.join(self.arch_dir, f"run_{run_id}"))
+        cd_k = int(self.params.get("JOINT_CD", self.params.get("CD", 1)))
+        for epoch in range(epochs):
+            epoch_losses = []
+            for _, labels in self.dataloader:
+                batch = self._make_features(labels)
+                batch_loss = self.rbm.train_epoch(batch, epoch, epochs, CD=cd_k)
+                value = batch_loss.item() if isinstance(batch_loss, torch.Tensor) else float(batch_loss)
+                epoch_losses.append(value)
+            if epoch_losses:
+                mean_loss = sum(epoch_losses) / len(epoch_losses)
+                writer.add_scalar("Loss/text_rbm", mean_loss, epoch)
+                if self.wandb_run:
+                    self.wandb_run.log({"text_rbm/loss": mean_loss, "epoch": epoch})
+            torch.cuda.empty_cache()
+        writer.close()
+
+        self._log_validation_pca()
+
+    @torch.no_grad()
+    def represent(self, labels):
+        feat = self._make_features(labels)
+        return self.rbm.forward(feat)
+
+    @torch.no_grad()
+    def decode(self, hidden):
+        hidden = hidden.to(self.device).float()
+        decoded = self.rbm.backward(hidden)
+        if decoded.size(1) > self.num_labels:
+            return decoded[:, :self.num_labels]
+        return decoded
+    
+    def _make_features(self, labels):
+        labels = labels.to(self.device).float()
+        if self.positional_dim <= 0:
+            return labels
+
+        indices = torch.argmax(labels, dim=1)
+        pos = self.positional_table.to(self.device).index_select(0, indices)
+        features = torch.cat([labels, pos], dim=1)
+        return features
+
+    @staticmethod
+    def _build_positional_table(num_labels: int, dim: int) -> torch.Tensor:
+        if dim <= 0:
+            return None
+        position = torch.arange(num_labels, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, dim, 2, dtype=torch.float32) * (-math.log(10000.0) / dim))
+        table = torch.zeros(num_labels, dim, dtype=torch.float32)
+        table[:, 0::2] = torch.sin(position * div_term)
+        table[:, 1::2] = torch.cos(position * div_term)
+        table = (table + 1.0) / 2.0  # map to [0,1]
+        return table
+
+    def _log_validation_pca(self):
+        if self.wandb_run is None or self.val_loader is None:
+            return
+
+        embeddings = []
+        labels_numeric = []
+        with torch.no_grad():
+            for _, labs in self.val_loader:
+                labs = labs.to(self.device).float()
+                emb = self.represent(labs)
+                embeddings.append(emb.detach().cpu())
+                labels_numeric.append(torch.argmax(labs, dim=1).cpu())
+
+        if not embeddings:
+            return
+
+        emb = torch.cat(embeddings, dim=0)
+        if emb.size(0) < 2 or emb.size(1) < 2:
+            return
+
+        emb_np = emb.numpy()
+        labels_np = torch.cat(labels_numeric, dim=0).numpy()
+
+        try:
+            pca2 = PCA(n_components=2)
+            emb2 = pca2.fit_transform(emb_np)
+            fig, ax = plt.subplots(figsize=(6, 5))
+            scatter = ax.scatter(emb2[:, 0], emb2[:, 1], c=labels_np, cmap='tab20', s=12, alpha=0.7)
+            ax.set_title('Text RBM PCA (validation)')
+            ax.set_xlabel('PC1')
+            ax.set_ylabel('PC2')
+            plt.colorbar(scatter, ax=ax, label='Label')
+            fig.tight_layout()
+            self.wandb_run.log({'text_rbm/pca2d': wandb.Image(fig)})
+            plt.close(fig)
+        except Exception as exc:
+            self.wandb_run.log({'warn/text_rbm_pca_error': str(exc)})
+
+
 class iMDBN(nn.Module):
     def __init__(self, layer_sizes_img, layer_sizes_txt, joint_layer_size, params,
-                 dataloader, val_loader, device, log_root="logs-imdbn",num_labels =32, embedding_dim=64,
+                 dataloader, val_loader, device, text_posenc_dim=0,
+                 log_root="logs-imdbn",num_labels =32, embedding_dim=64,
                  wandb_run=None):
         super(iMDBN, self).__init__()
         self.params = params
@@ -594,16 +735,27 @@ class iMDBN(nn.Module):
         self.arch_dir = os.path.join(log_root, f"architecture_{self.arch_str}")
         os.makedirs(self.arch_dir, exist_ok=True)
 
-        # Unimodal iDBNs (these manage their own RBMs)
+        params["NUM_LABELS"] = self.num_labels
+
+        # Unimodal encoders (image: iDBN, text: single RBM)
         self.image_idbn = iDBN(layer_sizes=layer_sizes_img, params=params,
                                dataloader=self.dataloader, val_loader=val_loader,
                                device=device, log_root=log_root, text_flag=False,
                                wandb_run=wandb_run)
 
-        self.text_idbn = iDBN(layer_sizes=[self.num_labels] + layer_sizes_txt[1:], params=params,
-                              dataloader=self.dataloader, val_loader=val_loader,
-                              device=device, log_root=log_root, text_flag=True,
-                              wandb_run=wandb_run)
+        text_visible = layer_sizes_txt[0]
+        text_hidden = layer_sizes_txt[-1]
+        self.text_encoder = TextRBMEncoder(
+            num_visible=text_visible,
+            num_hidden=text_hidden,
+            params=params,
+            dataloader=self.dataloader,
+            val_loader=val_loader,
+            device=device,
+            log_root=log_root,
+            positional_dim=text_posenc_dim,
+            wandb_run=wandb_run,
+        )
 
         # Joint RBM on concatenated top-level reps
         joint_rbm_visible_size = layer_sizes_img[-1] + layer_sizes_txt[-1]
@@ -617,6 +769,8 @@ class iMDBN(nn.Module):
             final_momentum=params["FINAL_MOMENTUM"],
         )
         self.joint_rbm.to(self.device)
+        self.joint_cd = int(params.get("JOINT_CD", params.get("CD", 1)))
+        self.cross_gibbs_steps = int(params.get("CROSS_GIBBS_STEPS", 10))
 
         # supervised head from joint hidden -> predict N (regression)
         self.supervised_head = nn.Linear(joint_layer_size, 1).to(self.device)
@@ -659,7 +813,7 @@ class iMDBN(nn.Module):
         label_data = label_data.to(self.device).float()
 
         img_rep = self.image_idbn.represent(img_data)
-        txt_rep = self.text_idbn.represent(label_data)
+        txt_rep = self.text_encoder.represent(label_data)
 
         joint_input = torch.cat((img_rep, txt_rep), dim=1)
         return self.joint_rbm.forward(joint_input)
@@ -669,13 +823,13 @@ class iMDBN(nn.Module):
         # returns joint hidden probabilities (no grad)
         with torch.no_grad():
             img_rep = self.image_idbn.represent(img_data.to(self.device))
-            txt_rep = self.text_idbn.represent(labels.to(self.device))
+            txt_rep = self.text_encoder.represent(labels.to(self.device))
             joint_input = torch.cat((img_rep, txt_rep), dim=1)
             joint_h = self.joint_rbm.forward(joint_input)
         return joint_h
 
     # -----------------
-    def _cross_reconstruct(self, z_img, z_txt, gibbs_steps=20):
+    def _cross_reconstruct(self, z_img, z_txt, gibbs_steps=None):
         """
         Return:
         recon_img_from_txt, recon_txt_from_img
@@ -683,6 +837,8 @@ class iMDBN(nn.Module):
         z_txt: (B, Dz_txt)  top-level text rep (probabilities)
         """
         with torch.no_grad():
+            if gibbs_steps is None:
+                gibbs_steps = self.cross_gibbs_steps
             B = z_img.size(0)
             Dz_img = z_img.size(1)
             Dz_txt = z_txt.size(1)
@@ -707,9 +863,7 @@ class iMDBN(nn.Module):
             v_txt_top_from_img = v_final_from_img[:, Dz_img:]
 
             # decode text-top -> text space
-            recon_txt_from_img = v_txt_top_from_img
-            for rbm in reversed(self.text_idbn.layers):
-                recon_txt_from_img = rbm.backward(recon_txt_from_img)
+            recon_txt_from_img = self.text_encoder.decode(v_txt_top_from_img)
 
             # --- TEXT -> IMAGE (clamp text top) ---
             v_known = torch.zeros((B, Vdim), device=self.device)
@@ -730,7 +884,7 @@ class iMDBN(nn.Module):
 
 
     # -----------------
-    def train_joint(self, epochs, run_id=0, w_rec=1.0, w_sup=1.0, log_every_pca=10):
+    def train_joint(self, epochs, run_id=0, w_rec=1.0, w_sup=1.0, log_every_pca=10, log_every_probe=10):
         """
         Train joint RBM (via CD inside RBM.train_epoch) and also train a supervised
         head that predicts N from joint hidden probabilities.
@@ -746,28 +900,32 @@ class iMDBN(nn.Module):
             rec_losses = []
             for img_data, labels in self.dataloader:
                 img_data = img_data.to(self.device).view(img_data.size(0), -1).float()
-                labels = labels.to(self.device).float()  # one-hot or similar
+                labels_one_hot = labels.to(self.device).float()
+                numeric_targets = torch.argmax(labels_one_hot, dim=1, keepdim=True).float() + 1.0
                 #label_indices = labels.to(self.device).long()  # assume 0..num_labels-1
                 #labels_dense = self.label_embeddings(label_indices)  # (B, embedding_dim)
-                z_txt = self.text_idbn.represent(labels)
 
                 # get top-level reps (freeze unimodals)
                 with torch.no_grad():
                     z_img = self.image_idbn.represent(img_data)
-                    z_txt = self.text_idbn.represent(labels)
+                    z_txt = self.text_encoder.represent(labels_one_hot)
 
                 joint_input = torch.cat((z_img, z_txt), dim=1).to(self.device)
 
-                mask_p = self.params.get("JOINT_MASK_P", 0.3)
+                mask_base = self.params.get("JOINT_MASK_P", 0.3)
+                warmup_epochs = int(self.params.get("JOINT_WARMUP_EPOCHS", 0))
+                current_mask = mask_base
+                if warmup_epochs > 0:
+                    current_mask = mask_base * min(1.0, epoch / max(1, warmup_epochs))
 
-                if random.random() < mask_p:
+                img_width = z_img.size(1)
+
+                if random.random() < current_mask:
                     joint_input = joint_input.clone()
-                    joint_input[:, z_img:] = 0.0  # mask text
-                elif random.random() < mask_p:
+                    joint_input[:, img_width:] = 0.0  # mask text
+                elif random.random() < current_mask:
                     joint_input = joint_input.clone()
-                    joint_input[:, :z_img] = 0.0  # mask image
-                else:
-                    joint_input = joint_input
+                    joint_input[:, :img_width] = 0.0  # mask image
 
 
                 # 1) Train joint RBM via CD (updates internal weights)
@@ -776,7 +934,7 @@ class iMDBN(nn.Module):
 
                 # 2) Cross reconstruction losses (differentiable parts: supervised head; we use recon outputs as targets)
                 # Compute reconstructions from single modality (no grad for RBM ops here)
-                recon_img_from_txt, recon_txt_from_img = self._cross_reconstruct(z_img, z_txt,gibbs_steps=10)
+                recon_img_from_txt, recon_txt_from_img = self._cross_reconstruct(z_img, z_txt)
 
                 # image reconstruction loss: BCE between recon_img_from_txt (prob) and img_data (0/1)
                 # ensure shapes
@@ -784,32 +942,23 @@ class iMDBN(nn.Module):
                 L_rec_img = F.binary_cross_entropy(recon_img_from_txt.clamp(1e-6, 1-1e-6), img_data.clamp(0.0, 1.0), reduction='mean')
 
                 # text reconstruction loss: if labels are one-hot, use MSE or BCE
-                recon_txt_from_img = recon_txt_from_img.view(labels.size(0), -1)
-                L_rec_txt = F.mse_loss(recon_txt_from_img, labels, reduction='mean')
+                recon_txt_from_img = recon_txt_from_img.view(labels_one_hot.size(0), -1)
+                L_rec_txt = F.mse_loss(recon_txt_from_img, labels_one_hot, reduction='mean')
 
-                L_rec = (L_rec_img + L_rec_txt) * w_rec
-                rec_losses.append(float(L_rec.item()))
+                L_rec = (L_rec_img + L_rec_txt)
+                rec_losses.append(float((w_rec * L_rec).item()))
 
-                # 3) supervised head: predict N from joint hidden (we compute joint hidden probs now, allow grads on head)
-                joint_h = self.joint_rbm.forward(joint_input)  # probabilities (no grad inside RBM but returns tensor)
-                # enable grad for head training
-                pred_N = self.supervised_head(joint_h)  # (B,1)
-                # we need target numeric N: assume labels include N as integer in last column? 
-                # **IMPORTANT**: your dataloader must provide numeric N as separate tensor or encode it in labels.
-                # For now, we assume labels include N in a tensor attr (you must adapt to your dataloader).
-                # Here I try to read labels[:, -1] if present (fall back to zeros)
-                try:
-                    N_target = labels[:, -1].unsqueeze(1)  # if dataloader packs N there
-                except Exception:
-                    N_target = torch.zeros_like(pred_N).to(self.device)
+                if w_sup > 0:
+                    joint_h = self.joint_rbm.forward(joint_input)
+                    pred_N = self.supervised_head(joint_h)
+                    L_sup = F.mse_loss(pred_N, numeric_targets, reduction='mean') * w_sup
+                    sup_losses.append(float(L_sup.item()))
 
-                L_sup = F.mse_loss(pred_N, N_target, reduction='mean') * w_sup
-                sup_losses.append(float(L_sup.item()))
-
-                # Backprop supervised head + (optionally) small finetune on text_idbn/ image_idbn top layers:
-                self.sup_optimizer.zero_grad()
-                L_sup.backward()
-                self.sup_optimizer.step()
+                    self.sup_optimizer.zero_grad()
+                    L_sup.backward()
+                    self.sup_optimizer.step()
+                else:
+                    sup_losses.append(0.0)
 
             # epoch logging
             mean_cd = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
@@ -818,8 +967,29 @@ class iMDBN(nn.Module):
             writer.add_scalar("JointRBM/CD_loss", mean_cd, epoch)
             writer.add_scalar("JointRBM/rec_loss", mean_rec, epoch)
             writer.add_scalar("JointRBM/sup_loss", mean_sup, epoch)
+            if self.wandb_run:
+                self.wandb_run.log({
+                    "joint/cd_loss": mean_cd,
+                    "joint/reconstruction_loss": mean_rec,
+                    "joint/supervised_loss": mean_sup,
+                    "epoch": epoch
+                })
             #self.log_joint_cosine_similarity(writer, epoch)
             self.log_joint_diagnostics(writer, epoch, num_batches=5)
+            if epoch % log_every_probe == 0:
+                log_joint_linear_probe(
+                    self,
+                    epoch=epoch,
+                    n_bins=5,
+                    test_size=0.2,
+                    steps=1000,
+                    lr=1e-2,
+                    rng_seed=42,
+                    patience=20,
+                    min_delta=0.0,
+                    save_csv=True,
+                    metric_prefix="joint"
+                )
 
             # PCA logging for multimodal joint representations
             if self.wandb_run and self.features and epoch % log_every_pca == 0:
@@ -870,6 +1040,9 @@ class iMDBN(nn.Module):
     def save_model(self, path):
         model_copy = copy.deepcopy(self)
         model_copy.dataloader = None
+        if hasattr(model_copy, 'text_encoder'):
+            model_copy.text_encoder.dataloader = None
+            model_copy.text_encoder.val_loader = None
         with open(path, 'wb') as f:
             pickle.dump(model_copy, f)
         print(f"Model saved to {path}")
@@ -887,35 +1060,70 @@ class iMDBN(nn.Module):
         with torch.no_grad():
             # top-level reps
             z_img = self.image_idbn.represent(img_data)
-            z_txt = self.text_idbn.represent(lbl_data)
-            recon_img_from_txt, recon_txt_from_img = self._cross_reconstruct(z_img, z_txt,gibbs_steps=20)
+            z_txt = self.text_encoder.represent(lbl_data)
+            recon_img_from_txt, recon_txt_from_img = self._cross_reconstruct(z_img, z_txt)
 
         # ---- immagini ----
         recon_img_from_txt_norm = recon_img_from_txt.clamp(0, 1)
         img_grid = recon_img_from_txt_norm.view(-1, 1,
                         int(recon_img_from_txt_norm.size(1)**0.5),
                         int(recon_img_from_txt_norm.size(1)**0.5))
-        writer.add_images('CrossModality/Image_from_Label', img_grid, epoch)
+        grid_tensor = vutils.make_grid(img_grid.cpu(), nrow=min(num_samples, img_grid.size(0)))
+        writer.add_image('CrossModality/Image_from_Label', grid_tensor, epoch)
         
         # ---- labels ----
         recon_probs = recon_txt_from_img.clamp(0, 1)
 
         pred_indices = recon_probs.argmax(dim=1)  # predizione numerica
+        gt_indices = lbl_data.argmax(dim=1)
+        top1_acc = (pred_indices == gt_indices).float().mean().item()
+        writer.add_scalar("CrossModality/TextTop1", top1_acc, epoch)
 
-        rows = []
+        topk = min(3, recon_probs.size(1))
+        topk_indices = recon_probs.topk(topk, dim=1).indices
+        topk_acc = (topk_indices == gt_indices.unsqueeze(1)).any(dim=1).float().mean().item()
+        writer.add_scalar("CrossModality/TextTop3", topk_acc, epoch)
+
+        prob_clamped = recon_probs.clamp(1e-6, 1 - 1e-6)
+        text_ce = F.nll_loss(prob_clamped.log(), gt_indices)
+        writer.add_scalar("CrossModality/TextCrossEntropy", text_ce.item(), epoch)
+
+        img_mse = F.mse_loss(recon_img_from_txt, img_data)
+        writer.add_scalar("CrossModality/ImageMSE", img_mse.item(), epoch)
+
+        table_rows = []
         for i in range(min(num_samples, recon_probs.size(0))):
-            gt = lbl_data[i].argmax().item()
-            pred = pred_indices[i].item()
-            rows.append(f"Sample {i}: Pred = {pred}, GT = {gt}")
+            gt = int(gt_indices[i].item())
+            pred = int(pred_indices[i].item())
+            table_rows.append((i, pred, gt))
 
         table_str = " | Sample | Prediction | GroundTruth |\n"
         table_str += "|--------|------------|-------------|\n"
-        for i, row in enumerate(rows):
-            gt = lbl_data[i].argmax().item()
-            pred = pred_indices[i].item()
-            table_str += f"| {i} | {pred} | {gt} |\n"
+        for sample_idx, pred, gt in table_rows:
+            table_str += f"| {sample_idx} | {pred} | {gt} |\n"
 
         writer.add_text("CrossModality/Predictions", table_str, epoch)
+
+        if self.wandb_run:
+            grid_np = grid_tensor.detach().cpu()
+            self.wandb_run.log({
+                "cross_modality/image_from_text": wandb.Image(grid_np.permute(1, 2, 0).numpy(), caption=f"Epoch {epoch}"),
+                "cross_modality/text_top1": top1_acc,
+                "cross_modality/text_top3": topk_acc,
+                "cross_modality/text_ce": text_ce.item(),
+                "cross_modality/image_mse": img_mse.item(),
+                "epoch": epoch
+            })
+            wandb_table = wandb.Table(columns=["sample", "prediction", "ground_truth"],
+                                      data=[[int(s), int(p), int(g)] for s, p, g in table_rows])
+            self.wandb_run.log({"cross_modality/text_predictions": wandb_table, "epoch": epoch})
+
+            cm_plot = wandb.plot.confusion_matrix(
+                y_true=gt_indices.cpu().numpy(),
+                preds=pred_indices.cpu().numpy(),
+                class_names=[str(i + 1) for i in range(self.num_labels)]
+            )
+            self.wandb_run.log({"cross_modality/text_confusion": cm_plot, "epoch": epoch})
 
 
 
@@ -935,18 +1143,22 @@ class iMDBN(nn.Module):
                 labels = labels.to(self.device).float()
 
                 # Top-level unimodal reps
-                z_img = self.image_idbn.represent(img_data)
-                z_txt = self.text_idbn.represent(labels)
+                z_img = F.normalize(self.image_idbn.represent(img_data), dim=1)
+                z_txt = F.normalize(self.text_encoder.represent(labels), dim=1)
 
-                # Joint hidden reps
+                cos_dim = min(z_img.size(1), z_txt.size(1))
+                if cos_dim > 0:
+                    sim = F.cosine_similarity(
+                        z_img[:, :cos_dim], z_txt[:, :cos_dim], dim=1
+                    )
+                    cos_sims.append(sim.mean().item())
+
                 joint_h_img = self.joint_rbm.forward(torch.cat([z_img, torch.zeros_like(z_txt)], dim=1))
                 joint_h_txt = self.joint_rbm.forward(torch.cat([torch.zeros_like(z_img), z_txt], dim=1))
+                sim_joint = F.cosine_similarity(joint_h_img, joint_h_txt, dim=1)
+                cos_sims.append(sim_joint.mean().item())
 
-                # Cosine similarity per batch
-                sim = F.cosine_similarity(joint_h_img, joint_h_txt, dim=1)  # shape: (B,)
-                cos_sims.append(sim.mean().item())
-
-        mean_cos = sum(cos_sims) / len(cos_sims)
+        mean_cos = sum(cos_sims) / len(cos_sims) if cos_sims else 0.0
         writer.add_scalar("JointRBM/cosine_similarity_img_txt", mean_cos, epoch)
         print(f"[Epoch {epoch}] Cosine similarity (img vs txt in joint space): {mean_cos:.4f}")
 
@@ -975,18 +1187,14 @@ class iMDBN(nn.Module):
                 labs = labels.to(self.device).float()
 
                 # Top-level unimodal reps
-                z_img = self.image_idbn.represent(imgs)   # (B, D_img)
-                z_txt = self.text_idbn.represent(labs)   # (B, D_txt)
+                z_img = F.normalize(self.image_idbn.represent(imgs), dim=1)   # (B, D_img)
+                z_txt = F.normalize(self.text_encoder.represent(labs), dim=1)   # (B, D_txt)
 
-                # Normalize for stable cosine computation
-                z_img_n = F.normalize(z_img, dim=1)
-                z_txt_n = F.normalize(z_txt, dim=1)
+                cos_dim = min(z_img.size(1), z_txt.size(1))
+                if cos_dim > 0:
+                    cos_z = F.cosine_similarity(z_img[:, :cos_dim], z_txt[:, :cos_dim], dim=1)  # (B,)
+                    cos_z_list.append(cos_z.cpu())
 
-                # cosine between z_img and z_txt (per sample)
-                cos_z = F.cosine_similarity(z_img_n, z_txt_n, dim=1)  # (B,)
-                cos_z_list.append(cos_z.cpu())
-
-                # Joint hidden when feeding only image / only text
                 zeros_txt = torch.zeros_like(z_txt).to(self.device)
                 zeros_img = torch.zeros_like(z_img).to(self.device)
 

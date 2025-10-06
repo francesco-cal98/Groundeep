@@ -68,7 +68,8 @@ class UniformDataset(Dataset):
     
     def __getitem__(self, idx):
         
-        data = (torch.tensor(self.data[idx])!=0 ).float()  # normalize the images 
+        raw_tensor = self.data[idx].clone().detach()
+        data = (raw_tensor != 0).float()  # normalize the images 
         labels = torch.tensor(self.labels[idx]) if not self.multimodal_flag else self.one_hot[idx] # if multimodal, return one-hot encoded labels
         if self.non_numerical:
             #TSA = torch.tensor(float(self.TSA_list[idx]))

@@ -1,0 +1,52 @@
+# multimodal_training_config.yaml
+# Configuration file for multimodal iDBN training.
+
+# Dataset settings
+dataset:
+  path: "/home/student/Desktop/Groundeep/stimuli_dataset_adaptive"
+  name: "stimuli_dataset.npz"
+  batch_size: 128
+  num_workers: 1
+  multimodal_flag: true
+
+# Model architecture
+model:
+  image_layers: [10000, 1500, 500]
+  text_layers: [64, 256]
+  text_posenc_dim: 32
+  joint_hidden: 512
+
+# Training hyperparameters
+training:
+  learning_rate: 0.1
+  weight_penalty: 0.0001
+  init_momentum: 0.5
+  final_momentum: 0.95
+  learning_rate_dynamic: true
+  cd: 1
+  epochs_image: 100
+  epochs_text: 30
+  epochs_joint: 200
+  joint_mask_p: 0.1
+  joint_warmup_epochs: 50
+  joint_cd: 10
+  cross_gibbs_steps: 50
+  log_every_pca: 25
+  log_every_probe: 5
+  w_rec: 5.0
+  w_sup: 0.0
+  text_learning_rate: 0.05
+  joint_learning_rate: 0.05
+
+# Output locations
+paths:
+  save_dir: "/home/student/Desktop/Groundeep/networks/zipfian/imdbn"
+  save_name: "imdbn_trained_zipfian"
+  image_idbn_pretrained: "/home/student/Desktop/Groundeep/networks/uniform/networks_probing/idbn_new_dataset_200_epochs_i_dbn_trained_uniform_1500_500.pkl"
+
+# Logging
+wandb:
+  enable: true
+  project: "groundeep-diagnostics-multimodal"
+  entity: null
+  run_name: null

@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 import pandas as pd  # <-- per DataFrame "stile Excel"
+import matplotlib.pyplot as plt
 
 try:
     import wandb
@@ -67,6 +68,39 @@ def compute_val_embeddings_and_features(model, upto_layer: int | None = None) ->
     feats = {"cum_area": cum_area, "convex_hull": chull, "labels": labels}
     if density is not None:
         feats["density"] = density
+    return E, feats
+
+
+@torch.no_grad()
+def compute_joint_embeddings_and_features(model) -> tuple[torch.Tensor, dict]:
+    """Compute joint embeddings (image + text) for a multimodal model."""
+    assert model.val_loader is not None, "val_loader is None."
+
+    embeds = []
+    for img_data, labels in model.val_loader:
+        img = img_data.to(model.device)
+        labs = labels.to(model.device)
+        z = model.represent((img, labs))
+        embeds.append(z.detach().cpu())
+
+    if not embeds:
+        return torch.empty(0), {}
+
+    E = torch.cat(embeds, dim=0)
+
+    feats_src = getattr(model, 'features', None)
+    if feats_src is None:
+        raise RuntimeError("Model.features is required for joint linear probe.")
+
+    feats = {
+        "cum_area": feats_src["Cumulative Area"].view(-1).cpu(),
+        "convex_hull": feats_src["Convex Hull"].view(-1).cpu(),
+        "labels": feats_src["Labels"].view(-1).cpu(),
+    }
+    density = feats_src.get("Density") if isinstance(feats_src, dict) else None
+    if density is not None:
+        feats["density"] = density.view(-1).cpu()
+
     return E, feats
 
 
@@ -307,6 +341,8 @@ def log_linear_probe(
     if "density" in feats:
         probe_targets.append("density")
 
+    summary_rows = []
+
     for mkey in probe_targets:
         # 1) target binned (stesso numero di livelli) + nomi dei bin
         y, n_classes, edges, bin_names = _prepare_targets(feats, mkey, n_bins=n_bins)
@@ -333,6 +369,8 @@ def log_linear_probe(
             min_delta=min_delta,
         )
 
+        summary_rows.append((metric_name, acc))
+
         # 4) Confusion matrix "Excel-like" (DataFrame con nomi bin)
         df = _confusion_df(y_true, y_pred, n_classes, bin_names)
 
@@ -347,3 +385,95 @@ def log_linear_probe(
             # (facoltativo) potresti anche loggare il path su W&B:
             if model.wandb_run and wandb is not None:
                 model.wandb_run.log({f"probe/{metric_name}/confusion_csv_path": csv_path, "epoch": epoch})
+
+    if summary_rows and model.wandb_run and wandb is not None:
+        labels = [name for name, _ in summary_rows]
+        values = [val for _, val in summary_rows]
+        fig, ax = plt.subplots(figsize=(max(6, len(labels) * 1.2), 4))
+        ax.bar(range(len(labels)), values, color='steelblue')
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, rotation=45, ha='right')
+        ax.set_ylim(0, 1)
+        ax.set_ylabel('Accuracy')
+        ax.set_title(f"Linear probe summary @ epoch {epoch}")
+        fig.tight_layout()
+        model.wandb_run.log({f"probe/{layer_tag or 'top'}/summary": wandb.Image(fig)})
+        plt.close(fig)
+
+
+def log_joint_linear_probe(
+    model,
+    epoch: int,
+    n_bins: int = 5,
+    test_size: float = 0.2,
+    steps: int = 1000,
+    lr: float = 1e-2,
+    rng_seed: int = 42,
+    patience: int = 20,
+    min_delta: float = 0.0,
+    save_csv: bool = True,
+    metric_prefix: str = "joint",
+):
+    """Linear probe for multimodal joint embeddings (image & text)."""
+    E, feats = compute_joint_embeddings_and_features(model)
+    if E.numel() == 0:
+        return
+    E_np = E.numpy()
+
+    probe_targets = ["cum_area", "convex_hull", "labels"]
+    if "density" in feats:
+        probe_targets.append("density")
+
+    summary_rows = []
+
+    for mkey in probe_targets:
+        y, n_classes, edges, bin_names = _prepare_targets(feats, mkey, n_bins=n_bins)
+        metric_name = f"{metric_prefix}/{mkey}" if metric_prefix else mkey
+
+        train_idx, test_idx = stratified_split(y, test_size=test_size, rng_seed=rng_seed)
+        if len(train_idx) == 0 or len(test_idx) == 0:
+            _log_accuracy_wandb(getattr(model, 'wandb_run', None), f"{metric_name}/warn_empty_split", 0.0, epoch)
+            continue
+
+        Xtr, ytr = E_np[train_idx], y.numpy()[train_idx]
+        Xte, yte = E_np[test_idx],  y.numpy()[test_idx]
+
+        acc, y_true, y_pred = train_linear_classifier(
+            Xtr, ytr, Xte, yte,
+            device=model.device,
+            n_classes=n_classes,
+            max_steps=steps,
+            lr=lr,
+            weight_decay=0.0,
+            patience=patience,
+            min_delta=min_delta,
+        )
+
+        summary_rows.append((metric_name, acc))
+
+        df = _confusion_df(y_true, y_pred, n_classes, bin_names)
+
+        wandb_run = getattr(model, 'wandb_run', None)
+        _log_accuracy_wandb(wandb_run, metric_name, acc, epoch)
+        _log_confusion_table_wandb(wandb_run, df, metric_name, epoch)
+        _log_bin_edges_wandb(wandb_run, metric_name, edges, epoch)
+
+        if save_csv:
+            csv_metric_name = metric_name.replace('/', '_')
+            csv_path = _save_confusion_csv(df, model, csv_metric_name, epoch)
+            if wandb_run and wandb is not None:
+                wandb_run.log({f"probe/{metric_name}/confusion_csv_path": csv_path, "epoch": epoch})
+
+    if summary_rows and wandb_run and wandb is not None:
+        labels = [name for name, _ in summary_rows]
+        values = [val for _, val in summary_rows]
+        fig, ax = plt.subplots(figsize=(max(6, len(labels) * 1.2), 4))
+        ax.bar(range(len(labels)), values, color='indianred')
+        ax.set_xticks(range(len(labels)))
+        ax.set_xticklabels(labels, rotation=45, ha='right')
+        ax.set_ylim(0, 1)
+        ax.set_ylabel('Accuracy')
+        ax.set_title(f"Joint probe summary @ epoch {epoch}")
+        fig.tight_layout()
+        wandb_run.log({f"probe/{metric_prefix or 'joint'}/summary": wandb.Image(fig)})
+        plt.close(fig)

@@ -6,7 +6,7 @@ model_to_analyze:
     distribution: "uniform"
     epochs: 60
     model_type: "idbn"
-    model_path: "/home/student/Desktop/Groundeep/networks/uniform/idbn_new_dataset_60_epochs_i_dbn_trained_uniform_1500_500.pkl"
+    model_path: "/home/student/Desktop/Groundeep/networks/uniform/networks_probing/idbn_new_dataset_200_epochs_i_dbn_trained_uniform_1500_500.pkl"
 
   - arch: "IMG10000-1500-500_TXT32-500-500_JOINT1000"
     distribution: "zipfian"
@@ -22,7 +22,7 @@ model_to_analyze:
 #    epochs: 60
 
 # Parametri del dataset e dei percorsi per le analisi
-dataset_path: "/home/student/Desktop/Groundeep/stimuli_dataset_adaptive"
+dataset_path: "/home/student/Desktop/Groundeep/stimuli_dataset_adaptive_auto"
 dataset_name: "stimuli_dataset.npz"
 batch_size: 128
 num_workers: 1
