@@ -50,8 +50,6 @@ def build_params(cfg: dict) -> dict:
         "EPOCHS": training_cfg.get("epochs_image", 100),
         "EPOCHS TEXT": training_cfg.get("epochs_text", 30),
         "EPOCHS JOINT": training_cfg.get("epochs_joint", 200),
-        "JOINT_MASK_P": training_cfg.get("joint_mask_p", 0.1),
-        "JOINT_WARMUP_EPOCHS": training_cfg.get("joint_warmup_epochs", 0),
         "LOG_EVERY_PCA": training_cfg.get("log_every_pca", 10),
         "LOG_EVERY_PROBE": training_cfg.get("log_every_probe", training_cfg.get("log_every_pca", 10)),
         "W_REC": training_cfg.get("w_rec", 1.0),
@@ -60,12 +58,21 @@ def build_params(cfg: dict) -> dict:
         "CROSS_GIBBS_STEPS": training_cfg.get("cross_gibbs_steps", 10),
         "TEXT_LEARNING_RATE": training_cfg.get("text_learning_rate", training_cfg.get("learning_rate", 0.1)),
         "JOINT_LEARNING_RATE": training_cfg.get("joint_learning_rate", training_cfg.get("learning_rate", 0.1)),
+        # Auxiliary clamped-CD controls
+        "JOINT_AUX_EVERY_K": training_cfg.get("joint_aux_every_k", 2),
+        "JOINT_AUX_CD": training_cfg.get("joint_aux_cd", 1),
+        "JOINT_AUX_COND_STEPS": training_cfg.get("joint_aux_cond_steps", 25),
+        "JOINT_AUX_LR_SCALE": training_cfg.get("joint_aux_lr_scale", 0.2),
         "SAVE_PATH": paths_cfg.get("save_dir", "networks/zipfian/imdbn"),
         "SAVE_NAME": paths_cfg.get("save_name", "imdbn_trained"),
         "ENABLE_WANDB": wandb_cfg.get("enable", False),
         "WANDB_PROJECT": wandb_cfg.get("project"),
         "WANDB_ENTITY": wandb_cfg.get("entity"),
         "WANDB_RUN_NAME": wandb_cfg.get("run_name"),
+        # Label feature enrichments for TextRBMEncoder
+        "LABEL_SMOOTH_SIGMA": cfg.get("model", {}).get("label_smooth_sigma", 0.0),
+        "INCLUDE_LABEL_SCALAR": cfg.get("model", {}).get("include_label_scalar", False),
+        "LABEL_FOURIER_K": cfg.get("model", {}).get("label_fourier_k", 0),
     }
     return params
 

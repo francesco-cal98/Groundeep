@@ -576,18 +576,35 @@ class TextRBMEncoder:
         self.dataloader = dataloader
         self.val_loader = val_loader
         self.wandb_run = wandb_run
-        self.num_labels = params.get("NUM_LABELS", 32)
-        self.positional_dim = positional_dim
-        self.feature_dim = num_visible
+        self.num_labels = int(params.get("NUM_LABELS", 32))
+        self.positional_dim = int(positional_dim)
+        self.gaussian_sigma = float(params.get("LABEL_SMOOTH_SIGMA", 0.0))
+        self.include_scalar = bool(params.get("INCLUDE_LABEL_SCALAR", False))
+        self.fourier_k = int(params.get("LABEL_FOURIER_K", 0))
 
-        if self.positional_dim > 0 and self.feature_dim != self.num_labels + self.positional_dim:
-            raise ValueError(
-                f"TextRBMEncoder expects feature_dim = num_labels + positional_dim; got {self.feature_dim} vs {self.num_labels + self.positional_dim}"
-            )
+        # Compute feature dim dynamically: one-hot + posenc + gaussian + scalar/Fourier
+        feature_dim = self.num_labels
+        if self.positional_dim > 0:
+            feature_dim += self.positional_dim
+        if self.gaussian_sigma > 0.0:
+            feature_dim += self.num_labels
+        if self.include_scalar:
+            feature_dim += 1 + (2 * self.fourier_k)
+        self.feature_dim = feature_dim
 
+        # Precompute positional table if needed
         self.positional_table = None
         if self.positional_dim > 0:
             self.positional_table = self._build_positional_table(self.num_labels, self.positional_dim)
+
+        # Precompute Gaussian basis over labels if needed
+        self.gauss_basis = None
+        if self.gaussian_sigma > 0.0:
+            idx = torch.arange(self.num_labels, dtype=torch.float32).unsqueeze(1)
+            centers = torch.arange(self.num_labels, dtype=torch.float32).unsqueeze(0)
+            d2 = (idx - centers) ** 2  # [L,L]
+            basis = torch.exp(-d2 / (2.0 * (self.gaussian_sigma ** 2)))
+            self.gauss_basis = (basis / (basis.sum(dim=1, keepdim=True) + 1e-8)).to(self.device)
 
         text_lr = params.get('TEXT_LEARNING_RATE', params['LEARNING_RATE'])
         self.rbm = RBM(
@@ -647,13 +664,27 @@ class TextRBMEncoder:
     
     def _make_features(self, labels):
         labels = labels.to(self.device).float()
-        if self.positional_dim <= 0:
-            return labels
+        idx = torch.argmax(labels, dim=1)
 
-        indices = torch.argmax(labels, dim=1)
-        pos = self.positional_table.to(self.device).index_select(0, indices)
-        features = torch.cat([labels, pos], dim=1)
-        return features
+        feats = [labels]
+        if self.positional_dim > 0 and self.positional_table is not None:
+            pos = self.positional_table.to(self.device).index_select(0, idx)
+            feats.append(pos)
+        if self.gaussian_sigma > 0.0 and self.gauss_basis is not None:
+            gauss = self.gauss_basis.index_select(0, idx)
+            feats.append(gauss)
+        if self.include_scalar:
+            x = idx.float() / max(1.0, float(self.num_labels - 1))
+            x = x.unsqueeze(1)
+            scalars = [x]
+            if self.fourier_k > 0:
+                two_pi = 2.0 * math.pi
+                ks = torch.arange(1, self.fourier_k + 1, device=self.device, dtype=torch.float32).unsqueeze(0)
+                ang = two_pi * x @ ks
+                scalars.append(torch.sin(ang))
+                scalars.append(torch.cos(ang))
+            feats.append(torch.cat(scalars, dim=1))
+        return torch.cat(feats, dim=1)
 
     @staticmethod
     def _build_positional_table(num_labels: int, dim: int) -> torch.Tensor:
@@ -721,8 +752,6 @@ class iMDBN(nn.Module):
         self.num_labels = num_labels
         self.embedding_dim = embedding_dim
 
-        # Learnable embeddings per label (dense vector per numero di dots)
-        self.label_embeddings = nn.Embedding(num_labels, embedding_dim).to(device)
 
 
         # Validation batch (images + labels)
@@ -898,7 +927,20 @@ class iMDBN(nn.Module):
             epoch_losses = []
             sup_losses = []
             rec_losses = []
-            for img_data, labels in self.dataloader:
+            # Train-set cross-reconstruction accumulators (log once per epoch)
+            tr_total = 0
+            tr_correct1 = 0
+            tr_correct3 = 0
+            tr_ce_sum = 0.0
+            tr_mse_sum = 0.0
+            last_npix = None
+            # Auxiliary clamped-CD settings (unsupervised strengthening of conditionals)
+            aux_every_k = int(self.params.get("JOINT_AUX_EVERY_K", 2))  # run aux every k batches
+            aux_cd_k = int(self.params.get("JOINT_AUX_CD", 1))
+            aux_cond_steps = int(self.params.get("JOINT_AUX_COND_STEPS", 25))
+            aux_lr_scale = float(self.params.get("JOINT_AUX_LR_SCALE", 0.2))
+
+            for b_idx, (img_data, labels) in enumerate(self.dataloader):
                 img_data = img_data.to(self.device).view(img_data.size(0), -1).float()
                 labels_one_hot = labels.to(self.device).float()
                 numeric_targets = torch.argmax(labels_one_hot, dim=1, keepdim=True).float() + 1.0
@@ -912,20 +954,7 @@ class iMDBN(nn.Module):
 
                 joint_input = torch.cat((z_img, z_txt), dim=1).to(self.device)
 
-                mask_base = self.params.get("JOINT_MASK_P", 0.3)
-                warmup_epochs = int(self.params.get("JOINT_WARMUP_EPOCHS", 0))
-                current_mask = mask_base
-                if warmup_epochs > 0:
-                    current_mask = mask_base * min(1.0, epoch / max(1, warmup_epochs))
-
-                img_width = z_img.size(1)
-
-                if random.random() < current_mask:
-                    joint_input = joint_input.clone()
-                    joint_input[:, img_width:] = 0.0  # mask text
-                elif random.random() < current_mask:
-                    joint_input = joint_input.clone()
-                    joint_input[:, :img_width] = 0.0  # mask image
+                # Removed modality masking: train joint RBM only on full (z_img, z_txt)
 
 
                 # 1) Train joint RBM via CD (updates internal weights)
@@ -941,9 +970,13 @@ class iMDBN(nn.Module):
                 recon_img_from_txt = recon_img_from_txt.view(img_data.size(0), -1)
                 L_rec_img = F.binary_cross_entropy(recon_img_from_txt.clamp(1e-6, 1-1e-6), img_data.clamp(0.0, 1.0), reduction='mean')
 
-                # text reconstruction loss: if labels are one-hot, use MSE or BCE
+                # text reconstruction loss: BCE on one-hot targets (independent Bernoulli per class)
                 recon_txt_from_img = recon_txt_from_img.view(labels_one_hot.size(0), -1)
-                L_rec_txt = F.mse_loss(recon_txt_from_img, labels_one_hot, reduction='mean')
+                L_rec_txt = F.binary_cross_entropy(
+                    recon_txt_from_img.clamp(1e-6, 1 - 1e-6),
+                    labels_one_hot,
+                    reduction='mean'
+                )
 
                 L_rec = (L_rec_img + L_rec_txt)
                 rec_losses.append(float((w_rec * L_rec).item()))
@@ -960,6 +993,63 @@ class iMDBN(nn.Module):
                 else:
                     sup_losses.append(0.0)
 
+                # Accumulate train cross-reconstruction metrics
+                with torch.no_grad():
+                    # text metrics (BCE vs one-hot)
+                    gt_idx = labels_one_hot.argmax(dim=1)
+                    pred_idx = recon_txt_from_img.argmax(dim=1)
+                    topk_idx = recon_txt_from_img.topk(k=min(3, recon_txt_from_img.size(1)), dim=1).indices
+                    bsz = img_data.size(0)
+                    tr_total += bsz
+                    tr_correct1 += (pred_idx == gt_idx).sum().item()
+                    tr_correct3 += (topk_idx == gt_idx.unsqueeze(1)).any(dim=1).sum().item()
+                    tr_ce_sum += float(F.binary_cross_entropy(
+                        recon_txt_from_img.clamp(1e-6, 1 - 1e-6),
+                        labels_one_hot,
+                        reduction='sum'
+                    ).item())
+
+                    # image mse (sum over pixels)
+                    recon_flat = recon_img_from_txt.view(img_data.size(0), -1)
+                    target_flat = img_data.view(img_data.size(0), -1)
+                    last_npix = target_flat.size(1)
+                    tr_mse_sum += float(F.mse_loss(recon_flat, target_flat, reduction='sum').item())
+
+                # 3) Auxiliary clamped-CD (unsupervised): strengthen p(z_txt|z_img) and p(z_img|z_txt)
+                do_aux = (aux_every_k > 0) and (b_idx % aux_every_k == 0)
+                if do_aux:
+                    B = z_img.size(0)
+                    Dz_img = z_img.size(1)
+                    Dz_txt = z_txt.size(1)
+                    Vdim = Dz_img + Dz_txt
+
+                    # Alternate which side to clamp (even batches: image-clamped; odd: text-clamped)
+                    clamp_image = (b_idx % 2 == 0)
+
+                    v_known = torch.zeros((B, Vdim), device=self.device)
+                    known_mask = torch.zeros_like(v_known)
+                    if clamp_image:
+                        v_known[:, :Dz_img] = z_img
+                        known_mask[:, :Dz_img] = 1.0
+                    else:
+                        v_known[:, Dz_img:] = z_txt
+                        known_mask[:, Dz_img:] = 1.0
+
+                    # Fill unknown modality with conditional Gibbs (no grad)
+                    with torch.no_grad():
+                        v_fill = self.joint_rbm.conditional_gibbs(
+                            v_known, known_mask, n_steps=aux_cond_steps, sample_h=False
+                        )
+
+                    # Temporarily scale LR for a lighter aux update
+                    old_lr = float(self.joint_rbm.lr)
+                    try:
+                        self.joint_rbm.lr = max(1e-8, old_lr * aux_lr_scale)
+                        aux_loss = self.joint_rbm.train_epoch(v_fill, epoch, epochs, CD=aux_cd_k)
+                        epoch_losses.append(float(aux_loss.item() if isinstance(aux_loss, torch.Tensor) else aux_loss))
+                    finally:
+                        self.joint_rbm.lr = old_lr
+
             # epoch logging
             mean_cd = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
             mean_rec = sum(rec_losses) / len(rec_losses) if rec_losses else 0.0
@@ -974,6 +1064,27 @@ class iMDBN(nn.Module):
                     "joint/supervised_loss": mean_sup,
                     "epoch": epoch
                 })
+            # Epoch-level train cross-reconstruction metrics
+            if tr_total > 0:
+                tr_top1 = tr_correct1 / tr_total
+                tr_top3 = tr_correct3 / tr_total
+                tr_ce_mean = tr_ce_sum / tr_total
+                # normalize MSE per-pixel per-sample
+                denom = max(1, tr_total * max(1, (last_npix or 1)))
+                tr_mse_mean = tr_mse_sum / denom
+                writer.add_scalar("CrossModalityTrain/TextTop1", tr_top1, epoch)
+                writer.add_scalar("CrossModalityTrain/TextTop3", tr_top3, epoch)
+                writer.add_scalar("CrossModalityTrain/TextBCE", tr_ce_mean, epoch)
+                writer.add_scalar("CrossModalityTrain/ImageMSE", tr_mse_mean, epoch)
+                if self.wandb_run:
+                    self.wandb_run.log({
+                        "cross_modality_train/text_top1": tr_top1,
+                        "cross_modality_train/text_top3": tr_top3,
+                        "cross_modality_train/text_bce": tr_ce_mean,
+                        "cross_modality_train/image_mse": tr_mse_mean,
+                        "cross_modality_train/n": int(tr_total),
+                        "epoch": epoch,
+                    })
             #self.log_joint_cosine_similarity(writer, epoch)
             self.log_joint_diagnostics(writer, epoch, num_batches=5)
             if epoch % log_every_probe == 0:
@@ -1000,7 +1111,7 @@ class iMDBN(nn.Module):
                         n_neighbors_umap = min(embeddings.shape[0] - 1, 15)
                         umap.UMAP(n_components=2, random_state=42, n_neighbors=n_neighbors_umap)
                         pca2 = PCA(n_components=2)
-                        emb_2d_pca = pca2.fit_transform(embeddings)
+                        emb_2d_pca = pca2.fit_transform(embeddings.numpy())
                         plot_2d_embedding_and_correlations(
                             emb_2d=emb_2d_pca,
                             features=self.features,
@@ -1011,7 +1122,7 @@ class iMDBN(nn.Module):
                         )
                         if embeddings.shape[1] >= 3 and embeddings.shape[0] >= 3:
                             pca3 = PCA(n_components=3)
-                            emb_3d_pca = pca3.fit_transform(embeddings)
+                            emb_3d_pca = pca3.fit_transform(embeddings.numpy())
                             plot_3d_embedding_and_correlations(
                                 emb_3d=emb_3d_pca,
                                 features=self.features,
@@ -1030,6 +1141,7 @@ class iMDBN(nn.Module):
                 print(f"[Joint RBM] Epoch {epoch}, CD_loss={mean_cd:.4f}, rec={mean_rec:.4f}, sup={mean_sup:.4f}")
             if epoch % 5 == 0:
                 self.log_cross_modality(writer, epoch, num_samples=5)
+                self.log_cross_modality_full(writer, epoch)
 
 
             torch.cuda.empty_cache()
@@ -1065,9 +1177,12 @@ class iMDBN(nn.Module):
 
         # ---- immagini ----
         recon_img_from_txt_norm = recon_img_from_txt.clamp(0, 1)
-        img_grid = recon_img_from_txt_norm.view(-1, 1,
-                        int(recon_img_from_txt_norm.size(1)**0.5),
-                        int(recon_img_from_txt_norm.size(1)**0.5))
+        try:
+            _, C, H, W = self.validation_images.shape
+        except Exception:
+            side = int(recon_img_from_txt_norm.size(1) ** 0.5)
+            C, H, W = 1, side, side
+        img_grid = recon_img_from_txt_norm.view(-1, C, H, W)
         grid_tensor = vutils.make_grid(img_grid.cpu(), nrow=min(num_samples, img_grid.size(0)))
         writer.add_image('CrossModality/Image_from_Label', grid_tensor, epoch)
         
@@ -1084,11 +1199,11 @@ class iMDBN(nn.Module):
         topk_acc = (topk_indices == gt_indices.unsqueeze(1)).any(dim=1).float().mean().item()
         writer.add_scalar("CrossModality/TextTop3", topk_acc, epoch)
 
-        prob_clamped = recon_probs.clamp(1e-6, 1 - 1e-6)
-        text_ce = F.nll_loss(prob_clamped.log(), gt_indices)
+        gt_onehot = F.one_hot(gt_indices, num_classes=recon_probs.size(1)).float()
+        text_ce = F.binary_cross_entropy(recon_probs.clamp(1e-6, 1 - 1e-6), gt_onehot)
         writer.add_scalar("CrossModality/TextCrossEntropy", text_ce.item(), epoch)
 
-        img_mse = F.mse_loss(recon_img_from_txt, img_data)
+        img_mse = F.mse_loss(recon_img_from_txt.view(img_data.size(0), -1), img_data.view(img_data.size(0), -1))
         writer.add_scalar("CrossModality/ImageMSE", img_mse.item(), epoch)
 
         table_rows = []
@@ -1124,6 +1239,70 @@ class iMDBN(nn.Module):
                 class_names=[str(i + 1) for i in range(self.num_labels)]
             )
             self.wandb_run.log({"cross_modality/text_confusion": cm_plot, "epoch": epoch})
+
+    def log_cross_modality_full(self, writer, epoch):
+        if self.val_loader is None:
+            return
+        total = 0
+        correct1 = 0
+        correct3 = 0
+        ce_sum = 0.0
+        mse_sum = 0.0
+        with torch.no_grad():
+            for img_data, lbl_data in self.val_loader:
+                imgs = img_data.to(self.device).view(img_data.size(0), -1).float()
+                labs = lbl_data.to(self.device).float()
+
+                z_img = self.image_idbn.represent(imgs)
+                z_txt = self.text_encoder.represent(labs)
+                recon_img_from_txt, recon_txt_from_img = self._cross_reconstruct(z_img, z_txt)
+
+                # Text metrics
+                gt_idx = labs.argmax(dim=1)
+                pred_idx = recon_txt_from_img.argmax(dim=1)
+                topk_idx = recon_txt_from_img.topk(k=min(3, recon_txt_from_img.size(1)), dim=1).indices
+                gt_onehot = F.one_hot(gt_idx, num_classes=recon_txt_from_img.size(1)).float()
+                ce = F.binary_cross_entropy(
+                    recon_txt_from_img.clamp(1e-6, 1 - 1e-6),
+                    gt_onehot,
+                    reduction='sum'
+                )
+
+                # Image MSE
+                mse = F.mse_loss(recon_img_from_txt.view_as(imgs), imgs, reduction='sum')
+
+                bsz = imgs.size(0)
+                total += bsz
+                correct1 += (pred_idx == gt_idx).sum().item()
+                correct3 += (topk_idx == gt_idx.unsqueeze(1)).any(dim=1).sum().item()
+                ce_sum += float(ce.item())
+                mse_sum += float(mse.item())
+
+        if total > 0:
+            top1 = correct1 / total
+            top3 = correct3 / total
+            ce_mean = ce_sum / total
+            # Normalize image MSE per pixel per sample for better scale
+            npix = None
+            try:
+                npix = int(self.validation_images.view(self.validation_images.size(0), -1).size(1))
+            except Exception:
+                npix = imgs.size(1)
+            denom = max(1, total * max(1, npix))
+            mse_mean = mse_sum / denom
+            writer.add_scalar("CrossModalityFull/TextTop1", top1, epoch)
+            writer.add_scalar("CrossModalityFull/TextTop3", top3, epoch)
+            writer.add_scalar("CrossModalityFull/TextCrossEntropy", ce_mean, epoch)
+            writer.add_scalar("CrossModalityFull/ImageMSE", mse_mean, epoch)
+            if self.wandb_run:
+                self.wandb_run.log({
+                    "cross_modality_full/text_top1": top1,
+                    "cross_modality_full/text_top3": top3,
+                    "cross_modality_full/text_ce": ce_mean,
+                    "cross_modality_full/image_mse": mse_mean,
+                    "cross_modality_full/n": int(total),
+                    "epoch": epoch,
+                })
 
 
 
@@ -1162,7 +1341,7 @@ class iMDBN(nn.Module):
         writer.add_scalar("JointRBM/cosine_similarity_img_txt", mean_cos, epoch)
         print(f"[Epoch {epoch}] Cosine similarity (img vs txt in joint space): {mean_cos:.4f}")
 
-    import torch.nn.functional as F
+    # (removed stray import) F is already imported at module level
 
     def log_joint_diagnostics(self, writer, epoch, num_batches=5):
         """
