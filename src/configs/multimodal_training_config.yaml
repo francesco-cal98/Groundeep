@@ -3,7 +3,7 @@
 
 # Dataset settings
 dataset:
-  path: "/home/student/Desktop/Groundeep/stimuli_dataset_adaptive"
+  path: "/home/student/Desktop/Groundeep/stimuli_dataset_adaptive_auto"
   name: "stimuli_dataset.npz"
   batch_size: 128
   num_workers: 1
@@ -11,13 +11,13 @@ dataset:
 
 # Model architecture
 model:
-  image_layers: [10000, 1500, 500]
+  image_layers: [10000, 1500, 1500]
   text_layers: [64, 256]
   text_posenc_dim: 0
-  label_smooth_sigma: 0.5   # e.g., 1.0 to add Gaussian-smoothed label features
-  include_label_scalar: true # include normalized label index [0,1] (+ Fourier if enabled)
+  label_smooth_sigma: 0   # e.g., 1.0 to add Gaussian-smoothed label features
+  include_label_scalar: false # include normalized label index [0,1] (+ Fourier if enabled)
   label_fourier_k: 0         # number of Fourier pairs (sin/cos), 0 disables
-  joint_hidden: 512
+  joint_hidden: 1000
 
 # Training hyperparameters
 training:
@@ -26,29 +26,29 @@ training:
   init_momentum: 0.5
   final_momentum: 0.95
   learning_rate_dynamic: true
-  cd: 1
+  cd: 10
   epochs_image: 100
   epochs_text: 10
   epochs_joint: 200
-  joint_cd: 5
+  joint_cd: 3
   cross_gibbs_steps: 100
   # Auxiliary clamped-CD (unsupervised conditional strengthening)
-  joint_aux_every_k: 2        # run aux clamped-CD every k batches
+  joint_aux_every_k: 1        # run aux clamped-CD every k batches
   joint_aux_cd: 1             # CD steps for auxiliary update
-  joint_aux_cond_steps: 25    # conditional Gibbs steps to fill missing modality
+  joint_aux_cond_steps: 50    # conditional Gibbs steps to fill missing modality
   joint_aux_lr_scale: 0.2     # scale factor on joint LR during aux update
   log_every_pca: 25
   log_every_probe: 5
   w_rec: 5.0
   w_sup: 0.0
   text_learning_rate: 0.01
-  joint_learning_rate: 0.05
+  joint_learning_rate: 0.005
 
 # Output locations
 paths:
-  save_dir: "/home/student/Desktop/Groundeep/networks/zipfian/imdbn"
-  save_name: "imdbn_trained_zipfian"
-  image_idbn_pretrained: "/home/student/Desktop/Groundeep/networks/uniform/networks_probing/idbn_new_dataset_200_epochs_i_dbn_trained_uniform_1500_500.pkl"
+  save_dir: "/home/student/Desktop/Groundeep/networks/uniform/imdbn"
+  save_name: "imdbn_trained_uniform"
+  image_idbn_pretrained: "/home/student/Desktop/Groundeep/networks/uniform/networks_probing/idbn_new_dataset_200_epochs_i_dbn_trained_uniform_1500_1500.pkl"
 
 # Logging
 wandb:

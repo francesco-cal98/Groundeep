@@ -20,31 +20,28 @@ from src.utils.wandb_utils import (
 )
 import copy
 import umap
-
 import torchvision.utils as vutils
-
-import torch
-import torch.nn.functional as F
 import sys
 
 current_dir = os.getcwd()
 project_root = os.path.abspath(os.path.join(current_dir, '..', '..'))
 sys.path.append(project_root)
-sys.path.append(current_dir) # Add current_dir if it contains other necessary modules
+sys.path.append(current_dir)
 
+from src.utils.probe_utils import log_linear_probe, log_joint_linear_probe
 
-# importa il tuo modulo utils
-from src.utils.probe_utils import log_linear_probe, log_joint_linear_probe  # <— qui l'orchestratore
-
-
-
-# Utility function for sigmoid activation
+# -------------------------
+# Utils
+# -------------------------
 def sigmoid(x):
     return 1 / (1 + torch.exp(-x))
 
-# RBM Class
+# -------------------------
+# RBM
+# -------------------------
 class RBM(nn.Module):
-    def __init__(self, num_visible, num_hidden, learning_rate, weight_decay, momentum, dynamic_lr=False, final_momentum=0.97,sparsity = False,sparsity_factor = 0.05):
+    def __init__(self, num_visible, num_hidden, learning_rate, weight_decay, momentum,
+                 dynamic_lr=False, final_momentum=0.97, sparsity=False, sparsity_factor=0.05):
         super(RBM, self).__init__()
         self.num_visible = num_visible
         self.num_hidden = num_hidden
@@ -56,7 +53,6 @@ class RBM(nn.Module):
         self.sparsity = sparsity
         self.sparsity_factor = sparsity_factor
 
-        # Weights and biases
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.W = nn.Parameter(
             torch.randn(num_visible, num_hidden, device=device) / math.sqrt(num_visible)
@@ -64,17 +60,27 @@ class RBM(nn.Module):
         self.hid_bias = nn.Parameter(torch.zeros(num_hidden, device=device))
         self.vis_bias = nn.Parameter(torch.zeros(num_visible, device=device))
 
-        # Gradients momentum
         self.W_momentum = torch.zeros_like(self.W)
         self.hid_bias_momentum = torch.zeros_like(self.hid_bias)
         self.vis_bias_momentum = torch.zeros_like(self.vis_bias)
 
+    # ------------ forward / backward (mean-field probs)
     def forward(self, v):
         return sigmoid(torch.matmul(v, self.W) + self.hid_bias)
 
     def backward(self, h):
         return sigmoid(torch.matmul(h, self.W.T) + self.vis_bias)
 
+    # ------------ single Gibbs step utility (with optional sampling)
+    @torch.no_grad()
+    def gibbs_step(self, v, sample_h=True, sample_v=True):
+        h_prob = self.forward(v)
+        h = (h_prob > torch.rand_like(h_prob)).float() if sample_h else h_prob
+        v_prob = self.backward(h)
+        v_next = (v_prob > torch.rand_like(v_prob)).float() if sample_v else v_prob
+        return v_next, v_prob, h, h_prob
+
+    # ------------ Standard CD-k
     def train_epoch(self, data, epoch, max_epochs, CD=1):
         total_loss = 0.0
         lr = self.lr / (1 + 0.01 * epoch) if self.dynamic_lr else self.lr
@@ -82,101 +88,134 @@ class RBM(nn.Module):
         momentum = self.momentum if epoch <= 5 else self.final_momentum
 
         with torch.no_grad():
-
-            # ========================================================
             # Positive phase
-            # ========================================================
-            pos_hid_probs = self.forward(data)
-            pos_hid_states = (pos_hid_probs > torch.rand_like(pos_hid_probs)).float()
-            pos_assoc = torch.matmul(data.T, pos_hid_probs)
+            pos_hid_prob = self.forward(data)
+            pos_hid = (pos_hid_prob > torch.rand_like(pos_hid_prob)).float()
+            pos_assoc = torch.matmul(data.T, pos_hid_prob)
 
-            # ========================================================
             # Negative phase (CD-k)
-            # ========================================================
-            neg_data = data
+            v_neg = data
+            h_neg = pos_hid
             for _ in range(CD):
-                neg_vis_probs = self.backward(pos_hid_states)
-                neg_data = (neg_vis_probs > torch.rand_like(neg_vis_probs)).float()
-                neg_hid_probs = self.forward(neg_data)
-                pos_hid_states = (neg_hid_probs > torch.rand_like(neg_hid_probs)).float()
-            neg_assoc = torch.matmul(neg_data.T, neg_hid_probs)
+                v_neg_prob = self.backward(h_neg)
+                v_neg = (v_neg_prob > torch.rand_like(v_neg_prob)).float()
+                h_neg_prob = self.forward(v_neg)
+                h_neg = (h_neg_prob > torch.rand_like(h_neg_prob)).float()
+            neg_assoc = torch.matmul(v_neg.T, h_neg_prob)
 
-            # ========================================================
-            # Update weights
-            # ========================================================
+            # Updates
             self.W_momentum.mul_(momentum).add_(
                 lr * ((pos_assoc - neg_assoc) / batch_size - self.weight_decay * self.W)
             )
             self.W.add_(self.W_momentum)
 
-            # ========================================================
-            # Update hidden biases (standard RBM update)
-            # ========================================================
             self.hid_bias_momentum.mul_(momentum).add_(
-                lr * (pos_hid_probs.sum(0) - neg_hid_probs.sum(0)) / batch_size
+                lr * (pos_hid_prob.sum(0) - h_neg_prob.sum(0)) / batch_size
             )
-
-            # Extra sparsity penalty (not through momentum)
             if self.sparsity:
-                Q = pos_hid_probs.sum(0) / batch_size
+                Q = pos_hid_prob.sum(0) / batch_size
                 avg_Q = Q.mean()
                 if avg_Q > self.sparsity_factor:
                     self.hid_bias_momentum.add_(-lr * (Q - self.sparsity_factor))
-
             self.hid_bias.add_(self.hid_bias_momentum)
 
-            # ========================================================
-            # Update visible biases
-            # ========================================================
             self.vis_bias_momentum.mul_(momentum).add_(
-                lr * (data.sum(0) - neg_data.sum(0)) / batch_size
+                lr * (data.sum(0) - v_neg.sum(0)) / batch_size
             )
             self.vis_bias.add_(self.vis_bias_momentum)
 
-            # Reconstruction error
-            batch_loss = torch.sum((data - neg_vis_probs) ** 2) / batch_size
-
+            batch_loss = torch.sum((data - v_neg_prob) ** 2) / batch_size
             torch.cuda.empty_cache()
 
         return batch_loss
-    
-    def conditional_gibbs(self, v_known, known_mask, n_steps=20, sample_h=False):
+
+    # ------------ Conditional Gibbs with re-clamp every step (MOD)
+    @torch.no_grad()
+    def conditional_gibbs(self, v_known, known_mask, n_steps=20, sample_h=True, sample_v=True):
         """
-        v_known: tensor (B, num_visible) - contains observed values where known_mask==1
-        known_mask: same shape, values 1.0 = known/locked, 0.0 = to be sampled
-        n_steps: number of alternating Gibbs steps
-        sample_h: if True sample binary hidden states, else use hidden probabilities
-        Returns:
-        v_probs: final visible probabilities (B, num_visible)
+        v_known: (B, V)  values where known_mask==1 will be clamped every step
+        known_mask: (B, V)  1.0 = known, 0.0 = to be sampled
+        Returns visible PROBABILITIES after n_steps.
         """
         device = self.W.device
-        v = v_known.clone().to(device)
+        v_known = v_known.to(device)
         km = known_mask.to(device)
 
-        # initialize unknown entries randomly in (0,1)
-        v = v * km + (1.0 - km) * torch.rand_like(v)
+        # init unknown with random in (0,1)
+        v = v_known * km + (1.0 - km) * torch.rand_like(v_known)
 
-        with torch.no_grad():
-            for _ in range(n_steps):
-                # hidden probabilities
-                h_probs = sigmoid(torch.matmul(v, self.W) + self.hid_bias)  # (B,H)
-                if sample_h:
-                    h_states = (h_probs > torch.rand_like(h_probs)).float()
-                    h_in = h_states
-                else:
-                    h_in = h_probs
+        for _ in range(n_steps):
+            h_prob = self.forward(v)
+            h = (h_prob > torch.rand_like(h_prob)).float() if sample_h else h_prob
+            v_prob = self.backward(h)
+            # re-impose clamp
+            v = v_prob * (1.0 - km) + v_known * km
+            if sample_v:
+                v = (v > torch.rand_like(v)).float() * (1.0 - km) + v_known * km
 
-                # visible probabilities
-                v_probs = sigmoid(torch.matmul(h_in, self.W.T) + self.vis_bias)  # (B,V)
-                # clamp known entries to their observed values
-                v = v_probs * (1.0 - km) + v_known * km
+        # return probabilities (more useful downstream)
+        return self.backward(self.forward(v))  # one smoothing pass
 
-        # return probabilities (useful downstream)
-        return v
+    # ------------ True clamped-CD training (MOD)
+    @torch.no_grad()
+    def train_epoch_clamped(self, v_known, known_mask, epoch, max_epochs, CD=1,
+                            cond_init_steps=25, sample_h=True, sample_v=True):
+        """
+        Positive: clamp known entries; unknown initialized via few conditional steps.
+        Negative: k Gibbs steps with re-clamp of known entries at every step.
+        """
+        lr = self.lr / (1 + 0.01 * epoch) if self.dynamic_lr else self.lr
+        batch_size = v_known.size(0)
+        momentum = self.momentum if epoch <= 5 else self.final_momentum
 
-    
-        
+        # ---- build a full v+ by filling unknowns conditionally
+        v_plus = self.conditional_gibbs(
+            v_known, known_mask, n_steps=cond_init_steps, sample_h=sample_h, sample_v=sample_v
+        )
 
+        # Positive stats (with known entries clamped)
+        h_plus_prob = self.forward(v_plus)
+        pos_assoc = torch.matmul(v_plus.T, h_plus_prob)
+
+        # Negative phase: k steps with re-clamp
+        v_neg = v_plus.clone()
+        for _ in range(CD):
+            # hidden
+            h_prob = self.forward(v_neg)
+            h = (h_prob > torch.rand_like(h_prob)).float() if sample_h else h_prob
+            # visible
+            v_prob = self.backward(h)
+            # re-clamp known
+            v_neg = v_prob * (1.0 - known_mask) + v_known * known_mask
+            if sample_v:
+                v_neg = (v_neg > torch.rand_like(v_neg)).float() * (1.0 - known_mask) + v_known * known_mask
+
+        h_neg_prob = self.forward(v_neg)
+        neg_assoc = torch.matmul(v_neg.T, h_neg_prob)
+
+        # Updates
+        self.W_momentum.mul_(momentum).add_(
+            lr * ((pos_assoc - neg_assoc) / batch_size - self.weight_decay * self.W)
+        )
+        self.W.add_(self.W_momentum)
+
+        self.hid_bias_momentum.mul_(momentum).add_(
+            lr * (h_plus_prob.sum(0) - h_neg_prob.sum(0)) / batch_size
+        )
+        self.hid_bias.add_(self.hid_bias_momentum)
+
+        self.vis_bias_momentum.mul_(momentum).add_(
+            lr * (v_plus.sum(0) - v_neg.sum(0)) / batch_size
+        )
+        self.vis_bias.add_(self.vis_bias_momentum)
+
+        # simple loss proxy
+        recon_loss = torch.mean((v_plus - v_neg) ** 2)
+        return recon_loss
+
+# -------------------------
+# gDBN (immagini unimodale)
+# -------------------------
 class gDBN:
     def __init__(self, layer_sizes, params, dataloader, device, log_dir="logs-gdbn"):
         self.layers = []
@@ -186,10 +225,7 @@ class gDBN:
         self.device = device
         self.log_dir = log_dir
 
-        # === Build architecture string from layer sizes ===
         arch_str = '-'.join(str(size) for size in layer_sizes)
-
-        # === Create unique log directory with architecture and timestamp ===
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         run_name = f"run_{arch_str}_{timestamp}"
         full_log_dir = os.path.join(self.log_dir, run_name)
@@ -210,8 +246,6 @@ class gDBN:
     def train(self, epochs):
         writer = SummaryWriter(log_dir=self.log_dir)
         all_epoch_losses = {}
-
-        # Select sample images for logging
         sample_images, _ = next(iter(self.dataloader))
         sample_images = sample_images[:5].to(self.device)
 
@@ -228,17 +262,14 @@ class gDBN:
                     train_data, _ = batch
                     train_data = train_data.to(self.device)
 
-                    # If this is NOT the first layer, pass through previous RBMs
                     if layer_idx > 0:
-                        with torch.no_grad():  # Prevent gradient tracking
-                            for prev_rbm in self.layers[:layer_idx]:  
+                        with torch.no_grad():
+                            for prev_rbm in self.layers[:layer_idx]:
                                 train_data = prev_rbm.forward(train_data)
 
-                    # Train the current RBM
                     batch_loss = rbm.train_epoch(train_data, epoch, epochs, CD=1)
                     total_loss += batch_loss
                     num_batches += 1
-
                     torch.cuda.empty_cache()
 
                 avg_epoch_loss = total_loss / num_batches
@@ -250,23 +281,15 @@ class gDBN:
         writer.close()
         return all_epoch_losses
 
-
     def save(self, path):
         self.dataloader = None
         self.writer = None
         with open(path, 'wb') as f:
             pickle.dump(self, f)
 
-
-
-import os
-import copy
-import pickle
-from tqdm import tqdm
-import torch
-import torch.nn.functional as F
-from torch.utils.tensorboard import SummaryWriter
-
+# -------------------------
+# iDBN (unimodale generico)
+# -------------------------
 class iDBN:
     def __init__(self, layer_sizes, params, dataloader, val_loader, device,
                  log_root="logs-idbn", text_flag: bool = False, wandb_run=None):
@@ -285,10 +308,7 @@ class iDBN:
             indices = val_loader.dataset.indices
             base_dataset = val_loader.dataset.dataset
 
-            # Cache original labels (could be one-hot for multimodal use-cases)
             self.val_labels_raw = val_labels
-
-            # Convert to numeric labels using the underlying dataset to ensure consistency
             numeric_labels = torch.tensor(
                 [base_dataset.labels[i] for i in indices],
                 dtype=torch.float32,
@@ -300,7 +320,6 @@ class iDBN:
             density_source = getattr(base_dataset, "density_list", None)
             self.density_vals = [density_source[i] for i in indices] if density_source is not None else None
 
-            # When we operate in multimodal mode keep a copy of one-hot labels for downstream needs
             if isinstance(val_labels, torch.Tensor) and val_labels.dim() > 1:
                 self.labels_one_hot = val_labels.detach().clone()
             else:
@@ -330,7 +349,6 @@ class iDBN:
         self.sparsity = self.params.get("SPARSITY", False)
         self.sparsity_factor = self.params.get("SPARSITY_FACTOR", 0.1)
 
-        # Costruzione RBM (come prima)
         for i in range(len(layer_sizes) - 1):
             rbm_params = {
                 'num_visible': layer_sizes[i],
@@ -381,13 +399,12 @@ class iDBN:
                     except Exception:
                         pass
 
-            # PCA logging per layer (first & top, when available)
+            # Use logical 'and' rather than bitwise '&' to combine truthiness
             if self.wandb_run and self.features and epoch % log_every_pca == 0:
                 for layer_idx in self._layers_to_monitor():
                     layer_tag = self._layer_tag(layer_idx)
                     self._log_layer_embeddings(layer_idx, layer_tag)
 
-            # 🔔 Linear probe logging via utils (per monitored layer)
             if self.wandb_run and self.features and self.val_loader is not None and epoch % log_every_probe == 0:
                 for layer_idx in self._layers_to_monitor():
                     layer_tag = self._layer_tag(layer_idx)
@@ -427,7 +444,6 @@ class iDBN:
     @torch.no_grad()
     def represent(self, x: torch.Tensor, upto_layer: int | None = None) -> torch.Tensor:
         v = x.view(x.size(0), -1).float().to(self.device)
-
         if upto_layer is None:
             target_layers = len(self.layers)
         else:
@@ -466,11 +482,9 @@ class iDBN:
     def _log_layer_embeddings(self, upto_layer: int, layer_tag: str) -> None:
         if not self.wandb_run or self.features is None:
             return
-
         source_batch = self._validation_source_batch()
         if source_batch is None:
             return
-
         try:
             with torch.no_grad():
                 embeddings = self.represent(source_batch, upto_layer=upto_layer).detach().cpu()
@@ -559,15 +573,9 @@ class iDBN:
         with open(path, 'wb') as f:
             pickle.dump(model_copy, f)
 
-    def load_model(self, path):
-        with open(path, 'rb') as f:
-            loaded = pickle.load(f)
-        self.__dict__.update(loaded.__dict__)
-
-# -----------------------
-# Multimodal iMDBN (joint RBM + supervised head + cross-rec)
-# -----------------------
-
+# -------------------------
+# TextRBMEncoder
+# -------------------------
 class TextRBMEncoder:
     def __init__(self, num_visible, num_hidden, params, dataloader, val_loader, device,
                  positional_dim=0, log_root="logs-text-rbm", wandb_run=None):
@@ -582,7 +590,6 @@ class TextRBMEncoder:
         self.include_scalar = bool(params.get("INCLUDE_LABEL_SCALAR", False))
         self.fourier_k = int(params.get("LABEL_FOURIER_K", 0))
 
-        # Compute feature dim dynamically: one-hot + posenc + gaussian + scalar/Fourier
         feature_dim = self.num_labels
         if self.positional_dim > 0:
             feature_dim += self.positional_dim
@@ -592,17 +599,15 @@ class TextRBMEncoder:
             feature_dim += 1 + (2 * self.fourier_k)
         self.feature_dim = feature_dim
 
-        # Precompute positional table if needed
         self.positional_table = None
         if self.positional_dim > 0:
             self.positional_table = self._build_positional_table(self.num_labels, self.positional_dim)
 
-        # Precompute Gaussian basis over labels if needed
         self.gauss_basis = None
         if self.gaussian_sigma > 0.0:
             idx = torch.arange(self.num_labels, dtype=torch.float32).unsqueeze(1)
             centers = torch.arange(self.num_labels, dtype=torch.float32).unsqueeze(0)
-            d2 = (idx - centers) ** 2  # [L,L]
+            d2 = (idx - centers) ** 2
             basis = torch.exp(-d2 / (2.0 * (self.gaussian_sigma ** 2)))
             self.gauss_basis = (basis / (basis.sum(dim=1, keepdim=True) + 1e-8)).to(self.device)
 
@@ -644,9 +649,40 @@ class TextRBMEncoder:
                 writer.add_scalar("Loss/text_rbm", mean_loss, epoch)
                 if self.wandb_run:
                     self.wandb_run.log({"text_rbm/loss": mean_loss, "epoch": epoch})
+
+            # Validation-set reconstruction diagnostics (aggregate)
+            if self.val_loader is not None:
+                try:
+                    total = 0
+                    correct = 0
+                    bce_sum = 0.0
+                    with torch.no_grad():
+                        for _, lbls in self.val_loader:
+                            lbls = lbls.to(self.device).float()
+                            feats = self._make_features(lbls)
+                            h = self.rbm.forward(feats)
+                            v_rec = self.rbm.backward(h)
+                            lbl_rec = v_rec[:, : self.num_labels].clamp(1e-6, 1 - 1e-6)
+                            gt_idx = lbls.argmax(dim=1)
+                            pred_idx = lbl_rec.argmax(dim=1)
+                            correct += (pred_idx == gt_idx).sum().item()
+                            bce_sum += float(F.binary_cross_entropy(lbl_rec, lbls, reduction='sum').item())
+                            total += lbls.size(0)
+                    if total > 0:
+                        top1 = correct / total
+                        bce_mean = bce_sum / total
+                        writer.add_scalar("TextRBM/ValReconTop1", top1, epoch)
+                        writer.add_scalar("TextRBM/ValReconBCE", bce_mean, epoch)
+                        if self.wandb_run:
+                            self.wandb_run.log({
+                                "text_rbm/val_recon_top1": top1,
+                                "text_rbm/val_recon_bce": bce_mean,
+                                "epoch": epoch,
+                            })
+                except Exception:
+                    pass
             torch.cuda.empty_cache()
         writer.close()
-
         self._log_validation_pca()
 
     @torch.no_grad()
@@ -695,7 +731,7 @@ class TextRBMEncoder:
         table = torch.zeros(num_labels, dim, dtype=torch.float32)
         table[:, 0::2] = torch.sin(position * div_term)
         table[:, 1::2] = torch.cos(position * div_term)
-        table = (table + 1.0) / 2.0  # map to [0,1]
+        table = (table + 1.0) / 2.0
         return table
 
     def _log_validation_pca(self):
@@ -736,11 +772,13 @@ class TextRBMEncoder:
         except Exception as exc:
             self.wandb_run.log({'warn/text_rbm_pca_error': str(exc)})
 
-
+# -------------------------
+# iMDBN (multimodale)
+# -------------------------
 class iMDBN(nn.Module):
     def __init__(self, layer_sizes_img, layer_sizes_txt, joint_layer_size, params,
                  dataloader, val_loader, device, text_posenc_dim=0,
-                 log_root="logs-imdbn",num_labels =32, embedding_dim=64,
+                 log_root="logs-imdbn", num_labels=32, embedding_dim=64,
                  wandb_run=None):
         super(iMDBN, self).__init__()
         self.params = params
@@ -752,9 +790,6 @@ class iMDBN(nn.Module):
         self.num_labels = num_labels
         self.embedding_dim = embedding_dim
 
-
-
-        # Validation batch (images + labels)
         val_batch, val_labels = next(iter(val_loader))
         self.validation_images = val_batch[:5].to(self.device)
         self.validation_labels = val_labels[:5].to(self.device)
@@ -766,7 +801,6 @@ class iMDBN(nn.Module):
 
         params["NUM_LABELS"] = self.num_labels
 
-        # Unimodal encoders (image: iDBN, text: single RBM)
         self.image_idbn = iDBN(layer_sizes=layer_sizes_img, params=params,
                                dataloader=self.dataloader, val_loader=val_loader,
                                device=device, log_root=log_root, text_flag=False,
@@ -786,29 +820,27 @@ class iMDBN(nn.Module):
             wandb_run=wandb_run,
         )
 
-        # Joint RBM on concatenated top-level reps
         joint_rbm_visible_size = layer_sizes_img[-1] + layer_sizes_txt[-1]
         self.joint_rbm = RBM(
             num_visible=joint_rbm_visible_size,
             num_hidden=joint_layer_size,
-            learning_rate=params['LEARNING_RATE'],
+            learning_rate=params.get('JOINT_LEARNING_RATE', params['LEARNING_RATE']),
             weight_decay=params['WEIGHT_PENALTY'],
             momentum=params['INIT_MOMENTUM'],
             dynamic_lr=params['LEARNING_RATE_DYNAMIC'],
             final_momentum=params["FINAL_MOMENTUM"],
+            sparsity=True,
+            sparsity_factor = 0.25
         )
         self.joint_rbm.to(self.device)
         self.joint_cd = int(params.get("JOINT_CD", params.get("CD", 1)))
         self.cross_gibbs_steps = int(params.get("CROSS_GIBBS_STEPS", 10))
 
-        # supervised head from joint hidden -> predict N (regression)
         self.supervised_head = nn.Linear(joint_layer_size, 1).to(self.device)
         self.sup_optimizer = torch.optim.Adam(self.supervised_head.parameters(), lr=1e-3)
 
-        # Cache dataset-driven features for downstream analyses (mirrors iDBN behaviour)
         indices = val_loader.dataset.indices
         base_dataset = val_loader.dataset.dataset
-
         numeric_labels = torch.tensor(
             [base_dataset.labels[i] for i in indices], dtype=torch.float32
         )
@@ -823,20 +855,34 @@ class iMDBN(nn.Module):
             ),
             "Labels": numeric_labels,
         }
-
         density_source = getattr(base_dataset, "density_list", None)
         if density_source is not None:
             self.features["Density"] = torch.tensor(
                 [density_source[i] for i in indices], dtype=torch.float32
             )
 
+    def _init_joint_visible_bias(self, n_batches=50):
+        vs = []
+        for i, (img, lbl) in enumerate(self.dataloader):
+            if i >= n_batches: break
+            imgs = img.to(self.device).view(img.size(0), -1).float()
+            labs = lbl.to(self.device).float()
+            z_txt = self.text_encoder.represent(labs)
+            Dz_img = self.image_idbn.layers[-1].num_hidden
+            z_img_const = torch.full((z_txt.size(0), Dz_img), 0.5, device=self.device)  # immagine neutra
+            v = torch.cat([z_img_const, z_txt], dim=1).clamp(1e-6, 1-1e-6)
+            vs.append(v)
+        p = torch.cat(vs, 0).mean(0)  # media congiunta
+        with torch.no_grad():
+            self.joint_rbm.vis_bias.copy_(torch.log(p/(1-p)))
+            self.joint_rbm.hid_bias.zero_()
+
     @torch.no_grad()
     def represent(self, batch):
-        """Return the joint hidden representation given (images, one-hot labels)."""
         if isinstance(batch, (tuple, list)):
             img_data, label_data = batch
         else:
-            raise ValueError("Expected batch to be a tuple (images, labels) for multimodal represent().")
+            raise ValueError("Expected batch to be (images, labels).")
 
         img_data = img_data.to(self.device).view(img_data.size(0), -1).float()
         label_data = label_data.to(self.device).float()
@@ -847,24 +893,16 @@ class iMDBN(nn.Module):
         joint_input = torch.cat((img_rep, txt_rep), dim=1)
         return self.joint_rbm.forward(joint_input)
 
-    # -----------------
+    @torch.no_grad()
     def forward(self, img_data, labels):
-        # returns joint hidden probabilities (no grad)
-        with torch.no_grad():
-            img_rep = self.image_idbn.represent(img_data.to(self.device))
-            txt_rep = self.text_encoder.represent(labels.to(self.device))
-            joint_input = torch.cat((img_rep, txt_rep), dim=1)
-            joint_h = self.joint_rbm.forward(joint_input)
+        img_rep = self.image_idbn.represent(img_data.to(self.device))
+        txt_rep = self.text_encoder.represent(labels.to(self.device))
+        joint_input = torch.cat((img_rep, txt_rep), dim=1)
+        joint_h = self.joint_rbm.forward(joint_input)
         return joint_h
 
-    # -----------------
-    def _cross_reconstruct(self, z_img, z_txt, gibbs_steps=None):
-        """
-        Return:
-        recon_img_from_txt, recon_txt_from_img
-        z_img: (B, Dz_img)  top-level image rep (probabilities)
-        z_txt: (B, Dz_txt)  top-level text rep (probabilities)
-        """
+    # -------- cross reconstruction (MOD: expose sample_h)
+    def _cross_reconstruct(self, z_img, z_txt, gibbs_steps=None, sample_h=False, sample_v=False):
         with torch.no_grad():
             if gibbs_steps is None:
                 gibbs_steps = self.cross_gibbs_steps
@@ -873,69 +911,75 @@ class iMDBN(nn.Module):
             Dz_txt = z_txt.size(1)
             Vdim = Dz_img + Dz_txt
 
-            # ensure same device & dtype
             z_img = z_img.to(self.device)
             z_txt = z_txt.to(self.device)
 
-            # normalize / clamp if useful (recommended)
-            # z_img = F.layer_norm(z_img, z_img.shape[1:])
-            # z_txt = F.layer_norm(z_txt, z_txt.shape[1:])
-
-            # --- IMAGE -> TEXT (clamp image top) ---
+            # --- IMG -> TXT
             v_known = torch.zeros((B, Vdim), device=self.device)
             known_mask = torch.zeros_like(v_known, device=self.device)
             v_known[:, :Dz_img] = z_img
             known_mask[:, :Dz_img] = 1.0
 
-            v_final_from_img = self.joint_rbm.conditional_gibbs(v_known, known_mask, n_steps=gibbs_steps, sample_h=False)
-            v_img_top_from_img = v_final_from_img[:, :Dz_img]
+            v_final_from_img = self.joint_rbm.conditional_gibbs(
+                v_known, known_mask, n_steps=gibbs_steps, sample_h=sample_h, sample_v=sample_v
+            )
             v_txt_top_from_img = v_final_from_img[:, Dz_img:]
-
-            # decode text-top -> text space
             recon_txt_from_img = self.text_encoder.decode(v_txt_top_from_img)
+            Dz_img = z_img.size(1)
+            v_txt_top = v_final_from_img[:, Dz_img:]
+            #print("Diag/var_joint_txt_top", float(v_txt_top.var()))
 
-            # --- TEXT -> IMAGE (clamp text top) ---
-            v_known = torch.zeros((B, Vdim), device=self.device)
-            known_mask = torch.zeros_like(v_known, device=self.device)
+            recon_probs = recon_txt_from_img.clamp(1e-6, 1-1e-6)
+            ent = -(recon_probs * recon_probs.log()).sum(dim=1).mean()
+            #print("CrossModality/TextEntropy", float(ent))
+
+
+            # --- TXT -> IMG
+            v_known.zero_()
+            known_mask.zero_()
             v_known[:, Dz_img:] = z_txt
             known_mask[:, Dz_img:] = 1.0
 
-            v_final_from_txt = self.joint_rbm.conditional_gibbs(v_known, known_mask, n_steps=gibbs_steps, sample_h=False)
+            v_final_from_txt = self.joint_rbm.conditional_gibbs(
+                v_known, known_mask, n_steps=gibbs_steps, sample_h=sample_h, sample_v=sample_v
+            )
             v_img_top_from_txt = v_final_from_txt[:, :Dz_img]
-            v_txt_top_from_txt = v_final_from_txt[:, Dz_img:]
 
-            # decode image-top -> image space
             recon_img_from_txt = v_img_top_from_txt
             for rbm in reversed(self.image_idbn.layers):
                 recon_img_from_txt = rbm.backward(recon_img_from_txt)
 
             return recon_img_from_txt, recon_txt_from_img
 
-
-    # -----------------
+    # -------- training joint
     def train_joint(self, epochs, run_id=0, w_rec=1.0, w_sup=1.0, log_every_pca=10, log_every_probe=10):
-        """
-        Train joint RBM (via CD inside RBM.train_epoch) and also train a supervised
-        head that predicts N from joint hidden probabilities.
-        - w_rec: weight for cross-reconstruction loss (BCE for images, CE for one-hot)
-        - w_sup: weight for supervised MSE loss
-        """
         writer = SummaryWriter(log_dir=os.path.join(self.arch_dir, f"run_{run_id}"))
-        cd_k = int(self.params.get("CD", 1))
+        # Use the dedicated joint CD setting
+        cd_k = int(self.params.get("JOINT_CD", self.params.get("CD", 1)))
+        
+        self._init_joint_visible_bias(n_batches=50)
+
+        for img_data, labels in self.dataloader:
+            imgs = img_data.to(self.device).view(img_data.size(0), -1).float()
+            labs = labels.to(self.device).float()
+            with torch.no_grad():
+                z_txt = self.text_encoder.represent(labs)
+                Dz_img = self.image_idbn.layers[-1].num_hidden
+                z_img_const = torch.full((z_txt.size(0), Dz_img), 0.5, device=self.device)
+                v0 = torch.cat([z_img_const, z_txt], dim=1)
+            _ = self.joint_rbm.train_epoch(v0, epoch=0, max_epochs=1, CD=self.joint_cd)
+            break  # una singola passata sul loader basta
+
 
         for epoch in tqdm(range(epochs)):
-            epoch_losses = []
-            sup_losses = []
-            rec_losses = []
-            # Train-set cross-reconstruction accumulators (log once per epoch)
-            tr_total = 0
-            tr_correct1 = 0
-            tr_correct3 = 0
-            tr_ce_sum = 0.0
-            tr_mse_sum = 0.0
+            epoch_losses, sup_losses, rec_losses = [], [], []
+
+            tr_total = tr_correct1 = tr_correct3 = 0
+            tr_ce_sum = tr_mse_sum = 0.0
             last_npix = None
-            # Auxiliary clamped-CD settings (unsupervised strengthening of conditionals)
-            aux_every_k = int(self.params.get("JOINT_AUX_EVERY_K", 2))  # run aux every k batches
+
+            # Aux hyper
+            aux_every_k = int(self.params.get("JOINT_AUX_EVERY_K", 2))
             aux_cd_k = int(self.params.get("JOINT_AUX_CD", 1))
             aux_cond_steps = int(self.params.get("JOINT_AUX_COND_STEPS", 25))
             aux_lr_scale = float(self.params.get("JOINT_AUX_LR_SCALE", 0.2))
@@ -944,58 +988,55 @@ class iMDBN(nn.Module):
                 img_data = img_data.to(self.device).view(img_data.size(0), -1).float()
                 labels_one_hot = labels.to(self.device).float()
                 numeric_targets = torch.argmax(labels_one_hot, dim=1, keepdim=True).float() + 1.0
-                #label_indices = labels.to(self.device).long()  # assume 0..num_labels-1
-                #labels_dense = self.label_embeddings(label_indices)  # (B, embedding_dim)
 
-                # get top-level reps (freeze unimodals)
                 with torch.no_grad():
                     z_img = self.image_idbn.represent(img_data)
                     z_txt = self.text_encoder.represent(labels_one_hot)
 
                 joint_input = torch.cat((z_img, z_txt), dim=1).to(self.device)
 
-                # Removed modality masking: train joint RBM only on full (z_img, z_txt)
+                """
+                with torch.no_grad():
+                    Dz_img = z_img.size(1)
+                    v_both = torch.cat([z_img, z_txt], 1)
+                    v_textonly = torch.cat([torch.zeros_like(z_img), z_txt], 1)
 
+                    h_both = self.joint_rbm.forward(v_both).mean().item()
+                    h_text = self.joint_rbm.forward(v_textonly).mean().item()
+                    print(f"h_mean both={h_both:.4f}  textonly={h_text:.4f}")
 
-                # 1) Train joint RBM via CD (updates internal weights)
+                    # quanto spinge ciascun blocco nella fase positiva
+                    h0 = self.joint_rbm.forward(v_both)
+                    pos = (v_both.T @ h0) / v_both.size(0)
+                    print("pos_img≈", float(pos[:Dz_img].abs().mean()),
+                        "pos_txt≈", float(pos[Dz_img:].abs().mean()))
+                """
+
+                # 1) Main CD on full joint input
                 batch_loss_cd = self.joint_rbm.train_epoch(joint_input, epoch, epochs, CD=cd_k)
                 epoch_losses.append(float(batch_loss_cd.item() if isinstance(batch_loss_cd, torch.Tensor) else batch_loss_cd))
 
-                # 2) Cross reconstruction losses (differentiable parts: supervised head; we use recon outputs as targets)
-                # Compute reconstructions from single modality (no grad for RBM ops here)
-                recon_img_from_txt, recon_txt_from_img = self._cross_reconstruct(z_img, z_txt)
+                # 2) Cross-reconstruction (deterministico per logging)
+                recon_img_from_txt, recon_txt_from_img = self._cross_reconstruct(
+                    z_img, z_txt, gibbs_steps=self.cross_gibbs_steps, sample_h=False, sample_v=False
+                )
 
-                # image reconstruction loss: BCE between recon_img_from_txt (prob) and img_data (0/1)
-                # ensure shapes
                 recon_img_from_txt = recon_img_from_txt.view(img_data.size(0), -1)
-                L_rec_img = F.binary_cross_entropy(recon_img_from_txt.clamp(1e-6, 1-1e-6), img_data.clamp(0.0, 1.0), reduction='mean')
+                L_rec_img = F.binary_cross_entropy(
+                    recon_img_from_txt.clamp(1e-6, 1-1e-6), img_data.clamp(0.0, 1.0), reduction='mean'
+                )
 
-                # text reconstruction loss: BCE on one-hot targets (independent Bernoulli per class)
                 recon_txt_from_img = recon_txt_from_img.view(labels_one_hot.size(0), -1)
                 L_rec_txt = F.binary_cross_entropy(
                     recon_txt_from_img.clamp(1e-6, 1 - 1e-6),
                     labels_one_hot,
                     reduction='mean'
                 )
-
                 L_rec = (L_rec_img + L_rec_txt)
                 rec_losses.append(float((w_rec * L_rec).item()))
 
-                if w_sup > 0:
-                    joint_h = self.joint_rbm.forward(joint_input)
-                    pred_N = self.supervised_head(joint_h)
-                    L_sup = F.mse_loss(pred_N, numeric_targets, reduction='mean') * w_sup
-                    sup_losses.append(float(L_sup.item()))
-
-                    self.sup_optimizer.zero_grad()
-                    L_sup.backward()
-                    self.sup_optimizer.step()
-                else:
-                    sup_losses.append(0.0)
-
-                # Accumulate train cross-reconstruction metrics
+                # Train-set metrics acc
                 with torch.no_grad():
-                    # text metrics (BCE vs one-hot)
                     gt_idx = labels_one_hot.argmax(dim=1)
                     pred_idx = recon_txt_from_img.argmax(dim=1)
                     topk_idx = recon_txt_from_img.topk(k=min(3, recon_txt_from_img.size(1)), dim=1).indices
@@ -1008,14 +1049,12 @@ class iMDBN(nn.Module):
                         labels_one_hot,
                         reduction='sum'
                     ).item())
-
-                    # image mse (sum over pixels)
-                    recon_flat = recon_img_from_txt.view(img_data.size(0), -1)
+                    recon_flat = recon_img_from_txt
                     target_flat = img_data.view(img_data.size(0), -1)
                     last_npix = target_flat.size(1)
                     tr_mse_sum += float(F.mse_loss(recon_flat, target_flat, reduction='sum').item())
 
-                # 3) Auxiliary clamped-CD (unsupervised): strengthen p(z_txt|z_img) and p(z_img|z_txt)
+                # 3) Auxiliary clamped-CD (vero clamp) — MOD
                 do_aux = (aux_every_k > 0) and (b_idx % aux_every_k == 0)
                 if do_aux:
                     B = z_img.size(0)
@@ -1023,7 +1062,6 @@ class iMDBN(nn.Module):
                     Dz_txt = z_txt.size(1)
                     Vdim = Dz_img + Dz_txt
 
-                    # Alternate which side to clamp (even batches: image-clamped; odd: text-clamped)
                     clamp_image = (b_idx % 2 == 0)
 
                     v_known = torch.zeros((B, Vdim), device=self.device)
@@ -1035,17 +1073,14 @@ class iMDBN(nn.Module):
                         v_known[:, Dz_img:] = z_txt
                         known_mask[:, Dz_img:] = 1.0
 
-                    # Fill unknown modality with conditional Gibbs (no grad)
-                    with torch.no_grad():
-                        v_fill = self.joint_rbm.conditional_gibbs(
-                            v_known, known_mask, n_steps=aux_cond_steps, sample_h=False
-                        )
-
-                    # Temporarily scale LR for a lighter aux update
                     old_lr = float(self.joint_rbm.lr)
                     try:
                         self.joint_rbm.lr = max(1e-8, old_lr * aux_lr_scale)
-                        aux_loss = self.joint_rbm.train_epoch(v_fill, epoch, epochs, CD=aux_cd_k)
+                        aux_loss = self.joint_rbm.train_epoch_clamped(
+                            v_known, known_mask, epoch, epochs,
+                            CD=aux_cd_k, cond_init_steps=aux_cond_steps,
+                            sample_h=True, sample_v=False  # stocastico per vera condizionale
+                        )
                         epoch_losses.append(float(aux_loss.item() if isinstance(aux_loss, torch.Tensor) else aux_loss))
                     finally:
                         self.joint_rbm.lr = old_lr
@@ -1053,23 +1088,19 @@ class iMDBN(nn.Module):
             # epoch logging
             mean_cd = sum(epoch_losses) / len(epoch_losses) if epoch_losses else 0.0
             mean_rec = sum(rec_losses) / len(rec_losses) if rec_losses else 0.0
-            mean_sup = sum(sup_losses) / len(sup_losses) if sup_losses else 0.0
             writer.add_scalar("JointRBM/CD_loss", mean_cd, epoch)
             writer.add_scalar("JointRBM/rec_loss", mean_rec, epoch)
-            writer.add_scalar("JointRBM/sup_loss", mean_sup, epoch)
             if self.wandb_run:
                 self.wandb_run.log({
                     "joint/cd_loss": mean_cd,
                     "joint/reconstruction_loss": mean_rec,
-                    "joint/supervised_loss": mean_sup,
                     "epoch": epoch
                 })
-            # Epoch-level train cross-reconstruction metrics
+
             if tr_total > 0:
                 tr_top1 = tr_correct1 / tr_total
                 tr_top3 = tr_correct3 / tr_total
                 tr_ce_mean = tr_ce_sum / tr_total
-                # normalize MSE per-pixel per-sample
                 denom = max(1, tr_total * max(1, (last_npix or 1)))
                 tr_mse_mean = tr_mse_sum / denom
                 writer.add_scalar("CrossModalityTrain/TextTop1", tr_top1, epoch)
@@ -1085,7 +1116,7 @@ class iMDBN(nn.Module):
                         "cross_modality_train/n": int(tr_total),
                         "epoch": epoch,
                     })
-            #self.log_joint_cosine_similarity(writer, epoch)
+
             self.log_joint_diagnostics(writer, epoch, num_batches=5)
             if epoch % log_every_probe == 0:
                 log_joint_linear_probe(
@@ -1102,7 +1133,6 @@ class iMDBN(nn.Module):
                     metric_prefix="joint"
                 )
 
-            # PCA logging for multimodal joint representations
             if self.wandb_run and self.features and epoch % log_every_pca == 0:
                 try:
                     with torch.no_grad():
@@ -1135,20 +1165,18 @@ class iMDBN(nn.Module):
                     if self.wandb_run:
                         self.wandb_run.log({"warn/imdbn_pca_logging_error": str(e)})
 
-
-
             if epoch % 10 == 0:
-                print(f"[Joint RBM] Epoch {epoch}, CD_loss={mean_cd:.4f}, rec={mean_rec:.4f}, sup={mean_sup:.4f}")
+                print(f"[Joint RBM] Epoch {epoch}, CD_loss={mean_cd:.4f}, rec={mean_rec:.4f}")
             if epoch % 5 == 0:
                 self.log_cross_modality(writer, epoch, num_samples=5)
                 self.log_cross_modality_full(writer, epoch)
-
+                self.log_joint_auto_recon(writer, epoch, num_samples=5)
 
             torch.cuda.empty_cache()
 
         writer.close()
 
-    # -----------------
+    # -------- save / load
     def save_model(self, path):
         model_copy = copy.deepcopy(self)
         model_copy.dataloader = None
@@ -1165,17 +1193,18 @@ class iMDBN(nn.Module):
         self.__dict__.update(loaded.__dict__)
         print(f"Model loaded from {path}")
 
+    # -------- logging helpers
     def log_cross_modality(self, writer, epoch, num_samples=5):
         img_data = self.validation_images[:num_samples]
         lbl_data = self.validation_labels[:num_samples]
 
         with torch.no_grad():
-            # top-level reps
             z_img = self.image_idbn.represent(img_data)
             z_txt = self.text_encoder.represent(lbl_data)
-            recon_img_from_txt, recon_txt_from_img = self._cross_reconstruct(z_img, z_txt)
+            recon_img_from_txt, recon_txt_from_img = self._cross_reconstruct(
+                z_img, z_txt, gibbs_steps=self.cross_gibbs_steps, sample_h=False, sample_v=False
+            )
 
-        # ---- immagini ----
         recon_img_from_txt_norm = recon_img_from_txt.clamp(0, 1)
         try:
             _, C, H, W = self.validation_images.shape
@@ -1186,10 +1215,8 @@ class iMDBN(nn.Module):
         grid_tensor = vutils.make_grid(img_grid.cpu(), nrow=min(num_samples, img_grid.size(0)))
         writer.add_image('CrossModality/Image_from_Label', grid_tensor, epoch)
         
-        # ---- labels ----
         recon_probs = recon_txt_from_img.clamp(0, 1)
-
-        pred_indices = recon_probs.argmax(dim=1)  # predizione numerica
+        pred_indices = recon_probs.argmax(dim=1)
         gt_indices = lbl_data.argmax(dim=1)
         top1_acc = (pred_indices == gt_indices).float().mean().item()
         writer.add_scalar("CrossModality/TextTop1", top1_acc, epoch)
@@ -1216,7 +1243,6 @@ class iMDBN(nn.Module):
         table_str += "|--------|------------|-------------|\n"
         for sample_idx, pred, gt in table_rows:
             table_str += f"| {sample_idx} | {pred} | {gt} |\n"
-
         writer.add_text("CrossModality/Predictions", table_str, epoch)
 
         if self.wandb_run:
@@ -1240,14 +1266,99 @@ class iMDBN(nn.Module):
             )
             self.wandb_run.log({"cross_modality/text_confusion": cm_plot, "epoch": epoch})
 
+    def log_joint_auto_recon(self, writer, epoch, num_samples=5):
+        """
+        Log reconstructions when BOTH modalities are present: encode both to joint hidden,
+        decode back to both image and label (no cross-reconstruction).
+        """
+        if self.validation_images is None or self.validation_labels is None:
+            return
+
+        img_data = self.validation_images[:num_samples]
+        lbl_data = self.validation_labels[:num_samples]
+
+        with torch.no_grad():
+            # encode unimodal tops
+            z_img = self.image_idbn.represent(img_data)
+            z_txt = self.text_encoder.represent(lbl_data)
+
+            Dz_img = z_img.size(1)
+            Dz_txt = z_txt.size(1)
+
+            # joint hidden
+            joint_input = torch.cat((z_img, z_txt), dim=1)
+            h = self.joint_rbm.forward(joint_input)
+
+            vb_txt = self.joint_rbm.vis_bias[Dz_img:]
+            print("joint vis_bias text mean/min/max:", vb_txt.mean().item(), vb_txt.min().item(), vb_txt.max().item())
+
+            # decode visible from joint hidden
+            v_recon = self.joint_rbm.backward(h)
+            v_img_top = v_recon[:, :Dz_img]
+            v_txt_top = v_recon[:, Dz_img:]
+
+            # decode to image space through image iDBN
+            recon_img = v_img_top
+            for rbm in reversed(self.image_idbn.layers):
+                recon_img = rbm.backward(recon_img)
+
+            # decode labels via text RBM backward (probabilities on first num_labels)
+            recon_lbl_probs = self.text_encoder.decode(v_txt_top)
+
+        # build image grid
+        recon_img = recon_img.clamp(0, 1)
+        try:
+            _, C, H, W = self.validation_images.shape
+        except Exception:
+            side = int(recon_img.size(1) ** 0.5)
+            C, H, W = 1, side, side
+        grid_tensor = vutils.make_grid(recon_img.view(-1, C, H, W).cpu(), nrow=min(num_samples, recon_img.size(0)))
+        writer.add_image('AutoRecon/Image_from_joint', grid_tensor, epoch)
+
+        # Also log ground-truth images side-by-side with joint reconstructions
+        gt_imgs = img_data.view(-1, C, H, W)
+        try:
+            pairs = torch.stack([gt_imgs, recon_img.view(-1, C, H, W)], dim=1)  # [B, 2, C, H, W]
+            pairs_flat = pairs.view(-1, C, H, W)
+        except Exception:
+            pairs_flat = torch.cat([gt_imgs, recon_img.view(-1, C, H, W)], dim=0)
+        grid_joint_vs_gt = vutils.make_grid(pairs_flat.cpu(), nrow=2)
+        writer.add_image('AutoRecon/GT_vs_JointRecon', grid_joint_vs_gt, epoch)
+
+        # label metrics
+        gt_indices = lbl_data.argmax(dim=1)
+        pred_indices = recon_lbl_probs.argmax(dim=1)
+        top1_acc = (pred_indices == gt_indices).float().mean().item()
+        writer.add_scalar("AutoRecon/TextTop1", top1_acc, epoch)
+        topk = min(3, recon_lbl_probs.size(1))
+        topk_indices = recon_lbl_probs.topk(topk, dim=1).indices
+        top3_acc = (topk_indices == gt_indices.unsqueeze(1)).any(dim=1).float().mean().item()
+        writer.add_scalar("AutoRecon/TextTop3", top3_acc, epoch)
+
+        gt_onehot = F.one_hot(gt_indices, num_classes=recon_lbl_probs.size(1)).float()
+        text_bce = F.binary_cross_entropy(recon_lbl_probs.clamp(1e-6, 1 - 1e-6), gt_onehot)
+        writer.add_scalar("AutoRecon/TextBCE", text_bce.item(), epoch)
+
+        # image MSE (normalized per-pixel per-sample)
+        mse = F.mse_loss(recon_img.view(img_data.size(0), -1), img_data.view(img_data.size(0), -1))
+        writer.add_scalar("AutoRecon/ImageMSE", mse.item(), epoch)
+
+        if self.wandb_run:
+            self.wandb_run.log({
+                "auto_recon/image_from_joint": wandb.Image(grid_tensor.detach().cpu().permute(1, 2, 0).numpy(), caption=f"Epoch {epoch}"),
+                "auto_recon/gt_vs_joint": wandb.Image(grid_joint_vs_gt.detach().cpu().permute(1, 2, 0).numpy(), caption=f"Epoch {epoch}"),
+                "auto_recon/text_top1": top1_acc,
+                "auto_recon/text_top3": top3_acc,
+                "auto_recon/text_bce": text_bce.item(),
+                "auto_recon/image_mse": mse.item(),
+                "epoch": epoch,
+            })
+
     def log_cross_modality_full(self, writer, epoch):
         if self.val_loader is None:
             return
-        total = 0
-        correct1 = 0
-        correct3 = 0
-        ce_sum = 0.0
-        mse_sum = 0.0
+        total = correct1 = correct3 = 0
+        ce_sum = mse_sum = 0.0
         with torch.no_grad():
             for img_data, lbl_data in self.val_loader:
                 imgs = img_data.to(self.device).view(img_data.size(0), -1).float()
@@ -1255,9 +1366,10 @@ class iMDBN(nn.Module):
 
                 z_img = self.image_idbn.represent(imgs)
                 z_txt = self.text_encoder.represent(labs)
-                recon_img_from_txt, recon_txt_from_img = self._cross_reconstruct(z_img, z_txt)
+                recon_img_from_txt, recon_txt_from_img = self._cross_reconstruct(
+                    z_img, z_txt, gibbs_steps=self.cross_gibbs_steps, sample_h=False, sample_v=False
+                )
 
-                # Text metrics
                 gt_idx = labs.argmax(dim=1)
                 pred_idx = recon_txt_from_img.argmax(dim=1)
                 topk_idx = recon_txt_from_img.topk(k=min(3, recon_txt_from_img.size(1)), dim=1).indices
@@ -1268,7 +1380,6 @@ class iMDBN(nn.Module):
                     reduction='sum'
                 )
 
-                # Image MSE
                 mse = F.mse_loss(recon_img_from_txt.view_as(imgs), imgs, reduction='sum')
 
                 bsz = imgs.size(0)
@@ -1282,8 +1393,6 @@ class iMDBN(nn.Module):
             top1 = correct1 / total
             top3 = correct3 / total
             ce_mean = ce_sum / total
-            # Normalize image MSE per pixel per sample for better scale
-            npix = None
             try:
                 npix = int(self.validation_images.view(self.validation_images.size(0), -1).size(1))
             except Exception:
@@ -1304,32 +1413,21 @@ class iMDBN(nn.Module):
                     "epoch": epoch,
                 })
 
-
-
     def log_joint_cosine_similarity(self, writer, epoch, num_batches=5):
-        """
-        Calcola e logga la cosine similarity tra rappresentazioni immagine e testo
-        nel joint RBM hidden space.
-        """
         cos_sims = []
-
         with torch.no_grad():
             for i, (img_data, labels) in enumerate(self.dataloader):
                 if i >= num_batches:
                     break
-
                 img_data = img_data.to(self.device).view(img_data.size(0), -1).float()
                 labels = labels.to(self.device).float()
 
-                # Top-level unimodal reps
                 z_img = F.normalize(self.image_idbn.represent(img_data), dim=1)
                 z_txt = F.normalize(self.text_encoder.represent(labels), dim=1)
 
                 cos_dim = min(z_img.size(1), z_txt.size(1))
                 if cos_dim > 0:
-                    sim = F.cosine_similarity(
-                        z_img[:, :cos_dim], z_txt[:, :cos_dim], dim=1
-                    )
+                    sim = F.cosine_similarity(z_img[:, :cos_dim], z_txt[:, :cos_dim], dim=1)
                     cos_sims.append(sim.mean().item())
 
                 joint_h_img = self.joint_rbm.forward(torch.cat([z_img, torch.zeros_like(z_txt)], dim=1))
@@ -1341,16 +1439,7 @@ class iMDBN(nn.Module):
         writer.add_scalar("JointRBM/cosine_similarity_img_txt", mean_cos, epoch)
         print(f"[Epoch {epoch}] Cosine similarity (img vs txt in joint space): {mean_cos:.4f}")
 
-    # (removed stray import) F is already imported at module level
-
     def log_joint_diagnostics(self, writer, epoch, num_batches=5):
-        """
-        Calcola e logga:
-        - cosine(z_img, z_txt) (prima del joint RBM)
-        - cosine(joint_h_img, joint_h_txt) (dopo joint RBM forward)
-        - distribuzioni / istogrammi e norme
-        Chiamalo da train_joint per avere diagnostica ogni epoca.
-        """
         cos_z_list = []
         cos_joint_list = []
         z_img_means, z_txt_means = [], []
@@ -1361,38 +1450,34 @@ class iMDBN(nn.Module):
                 if i >= num_batches:
                     break
 
-                # Prepara batch
                 imgs = img_data.to(self.device).view(img_data.size(0), -1).float()
                 labs = labels.to(self.device).float()
 
-                # Top-level unimodal reps
-                z_img = F.normalize(self.image_idbn.represent(imgs), dim=1)   # (B, D_img)
-                z_txt = F.normalize(self.text_encoder.represent(labs), dim=1)   # (B, D_txt)
+                z_img = F.normalize(self.image_idbn.represent(imgs), dim=1)
+                z_txt = F.normalize(self.text_encoder.represent(labs), dim=1)
 
                 cos_dim = min(z_img.size(1), z_txt.size(1))
                 if cos_dim > 0:
-                    cos_z = F.cosine_similarity(z_img[:, :cos_dim], z_txt[:, :cos_dim], dim=1)  # (B,)
+                    cos_z = F.cosine_similarity(z_img[:, :cos_dim], z_txt[:, :cos_dim], dim=1)
                     cos_z_list.append(cos_z.cpu())
 
                 zeros_txt = torch.zeros_like(z_txt).to(self.device)
                 zeros_img = torch.zeros_like(z_img).to(self.device)
 
-                joint_h_img = self.joint_rbm.forward(torch.cat([z_img, zeros_txt], dim=1))  # (B, H)
+                joint_h_img = self.joint_rbm.forward(torch.cat([z_img, zeros_txt], dim=1))
                 joint_h_txt = self.joint_rbm.forward(torch.cat([zeros_img, z_txt], dim=1))
 
                 joint_h_img_n = F.normalize(joint_h_img, dim=1)
                 joint_h_txt_n = F.normalize(joint_h_txt, dim=1)
 
-                cos_joint = F.cosine_similarity(joint_h_img_n, joint_h_txt_n, dim=1)  # (B,)
+                cos_joint = F.cosine_similarity(joint_h_img_n, joint_h_txt_n, dim=1)
                 cos_joint_list.append(cos_joint.cpu())
 
-                # stats
                 z_img_means.append(z_img.mean().item())
                 z_txt_means.append(z_txt.mean().item())
                 joint_img_norms.append(joint_h_img.norm(dim=1).mean().item())
                 joint_txt_norms.append(joint_h_txt.norm(dim=1).mean().item())
 
-        # aggregate
         if cos_z_list:
             cos_z_all = torch.cat(cos_z_list)
             writer.add_scalar("Diag/cosine_z_mean", float(cos_z_all.mean()), epoch)
@@ -1403,7 +1488,6 @@ class iMDBN(nn.Module):
             writer.add_scalar("Diag/cosine_joint_mean", float(cos_joint_all.mean()), epoch)
             writer.add_histogram("Diag/cosine_joint_hist", cos_joint_all.numpy(), epoch)
 
-        # norms / means
         if z_img_means:
             writer.add_scalar("Diag/z_img_mean", float(sum(z_img_means)/len(z_img_means)), epoch)
         if z_txt_means:
@@ -1413,7 +1497,6 @@ class iMDBN(nn.Module):
         if joint_txt_norms:
             writer.add_scalar("Diag/joint_txt_norm", float(sum(joint_txt_norms)/len(joint_txt_norms)), epoch)
 
-        # Print quick summary to console
         print(f"[Diag] epoch {epoch} | cos_z_mean {cos_z_all.mean():.4f} | cos_joint_mean {cos_joint_all.mean():.4f}")
 
 def plot_bar(values):

@@ -157,6 +157,7 @@ def main(config_path: Path = DEFAULT_CONFIG_PATH):
     else:
         print("Training image iDBN...")
         imdbn.image_idbn.train(params["EPOCHS"])
+        imdbn.image_idbn.save_model(str(save_path / "image_idbn_.pkl"))
 
     print("Training text iDBN...")
     imdbn.text_encoder.train(params["EPOCHS TEXT"])
