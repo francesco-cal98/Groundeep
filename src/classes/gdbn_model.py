@@ -829,7 +829,7 @@ class iMDBN(nn.Module):
             momentum=params['INIT_MOMENTUM'],
             dynamic_lr=params['LEARNING_RATE_DYNAMIC'],
             final_momentum=params["FINAL_MOMENTUM"],
-            sparsity=True,
+            sparsity=False,
             sparsity_factor = 0.25
         )
         self.joint_rbm.to(self.device)
@@ -860,8 +860,52 @@ class iMDBN(nn.Module):
             self.features["Density"] = torch.tensor(
                 [density_source[i] for i in indices], dtype=torch.float32
             )
+    @torch.no_grad()
+    def calibrate_gain_control(self, n_batches=30, eps=1e-6):
+        zs_img, zs_txt = [], []
+        for b, (imgs, lbls) in enumerate(self.dataloader):
+            if b >= n_batches: break
+            zi = self.image_idbn.represent(imgs.to(self.device).view(imgs.size(0), -1).float())
+            zt = self.text_encoder.represent(lbls.to(self.device).float())
+            zi = zi.clamp(1e-6, 1-1e-6); zt = zt.clamp(1e-6, 1-1e-6)
+            li = torch.log(zi) - torch.log1p(-zi)   # logit(img)
+            lt = torch.log(zt) - torch.log1p(-zt)   # logit(txt)
+            zs_img.append(li); zs_txt.append(lt)
+
+        Li = torch.cat(zs_img, 0); Lt = torch.cat(zs_txt, 0)
+        mu_i = Li.mean(0); si = Li.std(0).clamp_min(1e-3)
+        mu_t = Lt.mean(0); st = Lt.std(0).clamp_min(1e-3)
+
+        # scala “di blocco”: eguaglia solo l’ampiezza media del testo a quella dell’immagine
+        s_block_i = si.mean().item()
+        s_block_t = st.mean().item()
+        alpha_t = float(max(0.5, min(2.0, s_block_i / max(s_block_t, 1e-6))))
+
+        self._gc_stats = {
+            "mu_i": mu_i.detach(), "si": si.detach(),
+            "mu_t": mu_t.detach(), "st": st.detach(),
+            "alpha_i": 1.0, "alpha_t": alpha_t,
+            "eps": eps,
+        }
+
+    def _apply_gain(self, z_img, z_txt):
+        if not hasattr(self, "_gc_stats") or self._gc_stats is None:
+            return z_img, z_txt
+        g = self._gc_stats
+        zi = z_img.clamp(1e-6, 1-1e-6); li = torch.log(zi) - torch.log1p(-zi)
+        zt = z_txt.clamp(1e-6, 1-1e-6); lt = torch.log(zt) - torch.log1p(-zt)
+
+        li_cal = g["mu_i"] + g["alpha_i"] * (li - g["mu_i"])
+        lt_cal = g["mu_t"] + g["alpha_t"] * (lt - g["mu_t"])
+
+        zi_cal = torch.sigmoid(li_cal).clamp(1e-4, 1-1e-4)
+        zt_cal = torch.sigmoid(lt_cal).clamp(1e-4, 1-1e-4)
+        return zi_cal, zt_cal
+
 
     def _init_joint_visible_bias(self, n_batches=50):
+        
+        """
         vs = []
         for i, (img, lbl) in enumerate(self.dataloader):
             if i >= n_batches: break
@@ -876,6 +920,12 @@ class iMDBN(nn.Module):
         with torch.no_grad():
             self.joint_rbm.vis_bias.copy_(torch.log(p/(1-p)))
             self.joint_rbm.hid_bias.zero_()
+        """
+
+        
+        with torch.no_grad():
+            self.joint_rbm.vis_bias.zero_()
+            self.joint_rbm.hid_bias.zero_()
 
     @torch.no_grad()
     def represent(self, batch):
@@ -889,6 +939,7 @@ class iMDBN(nn.Module):
 
         img_rep = self.image_idbn.represent(img_data)
         txt_rep = self.text_encoder.represent(label_data)
+        img_rep, txt_rep = self._apply_gain(img_rep, txt_rep)   # <<< AGGIUNGI
 
         joint_input = torch.cat((img_rep, txt_rep), dim=1)
         return self.joint_rbm.forward(joint_input)
@@ -897,6 +948,8 @@ class iMDBN(nn.Module):
     def forward(self, img_data, labels):
         img_rep = self.image_idbn.represent(img_data.to(self.device))
         txt_rep = self.text_encoder.represent(labels.to(self.device))
+        img_rep, txt_rep = self._apply_gain(img_rep, txt_rep)   # <<< AGGIUNGI
+
         joint_input = torch.cat((img_rep, txt_rep), dim=1)
         joint_h = self.joint_rbm.forward(joint_input)
         return joint_h
@@ -958,18 +1011,8 @@ class iMDBN(nn.Module):
         cd_k = int(self.params.get("JOINT_CD", self.params.get("CD", 1)))
         
         self._init_joint_visible_bias(n_batches=50)
-
-        for img_data, labels in self.dataloader:
-            imgs = img_data.to(self.device).view(img_data.size(0), -1).float()
-            labs = labels.to(self.device).float()
-            with torch.no_grad():
-                z_txt = self.text_encoder.represent(labs)
-                Dz_img = self.image_idbn.layers[-1].num_hidden
-                z_img_const = torch.full((z_txt.size(0), Dz_img), 0.5, device=self.device)
-                v0 = torch.cat([z_img_const, z_txt], dim=1)
-            _ = self.joint_rbm.train_epoch(v0, epoch=0, max_epochs=1, CD=self.joint_cd)
-            break  # una singola passata sul loader basta
-
+        
+        self.calibrate_gain_control(n_batches=30)
 
         for epoch in tqdm(range(epochs)):
             epoch_losses, sup_losses, rec_losses = [], [], []
@@ -992,6 +1035,21 @@ class iMDBN(nn.Module):
                 with torch.no_grad():
                     z_img = self.image_idbn.represent(img_data)
                     z_txt = self.text_encoder.represent(labels_one_hot)
+                    if b_idx == 0:
+                        pre_i, pre_t = z_img.std().item(), z_txt.std().item()
+                        zi_g, zt_g = self._apply_gain(z_img, z_txt)  # applico una sola volta
+                        post_i, post_t = zi_g.std().item(), zt_g.std().item()
+                        print("GC/pre_std_img", pre_i, epoch)
+                        print("GC/pre_std_txt", pre_t, epoch)
+                        print("GC/post_std_img", post_i, epoch)
+                        print("GC/post_std_txt", post_t, epoch)
+
+                        z_img, z_txt = zi_g, zt_g  # usa i valori con gain
+                    else:
+                        z_img, z_txt = self._apply_gain(z_img, z_txt)
+
+                    
+
 
                 joint_input = torch.cat((z_img, z_txt), dim=1).to(self.device)
 
@@ -1201,6 +1259,7 @@ class iMDBN(nn.Module):
         with torch.no_grad():
             z_img = self.image_idbn.represent(img_data)
             z_txt = self.text_encoder.represent(lbl_data)
+            z_img, z_txt = self._apply_gain(z_img, z_txt)
             recon_img_from_txt, recon_txt_from_img = self._cross_reconstruct(
                 z_img, z_txt, gibbs_steps=self.cross_gibbs_steps, sample_h=False, sample_v=False
             )
@@ -1281,7 +1340,7 @@ class iMDBN(nn.Module):
             # encode unimodal tops
             z_img = self.image_idbn.represent(img_data)
             z_txt = self.text_encoder.represent(lbl_data)
-
+            z_img, z_txt = self._apply_gain(z_img, z_txt)
             Dz_img = z_img.size(1)
             Dz_txt = z_txt.size(1)
 
@@ -1366,6 +1425,7 @@ class iMDBN(nn.Module):
 
                 z_img = self.image_idbn.represent(imgs)
                 z_txt = self.text_encoder.represent(labs)
+                z_img, z_txt = self._apply_gain(z_img, z_txt)
                 recon_img_from_txt, recon_txt_from_img = self._cross_reconstruct(
                     z_img, z_txt, gibbs_steps=self.cross_gibbs_steps, sample_h=False, sample_v=False
                 )
