@@ -1,183 +1,147 @@
+# trainer_multimodal.py
 from pathlib import Path
-
-import argparse
-import sys
-
-import torch
+import argparse, sys, yaml, torch
 import wandb
-import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 SRC_ROOT = PROJECT_ROOT / 'src'
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
+for p in (PROJECT_ROOT, SRC_ROOT, SRC_ROOT / 'classes', SRC_ROOT / 'configs'):
+    if str(p) not in sys.path: sys.path.insert(0, str(p))
 
-from src.classes.gdbn_model import iDBN, iMDBN
+from src.classes.gdbn_model import iMDBN
 from src.datasets.uniform_dataset import create_dataloaders_uniform
 
-
-DEFAULT_CONFIG_PATH = Path("src/configs/multimodal_training_config.yaml")
+DEFAULT_CONFIG_PATH = SRC_ROOT / "configs" / "multimodal_training_config.yaml"
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train a multimodal iDBN")
-    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH,
-                        help="Path to the multimodal training configuration file")
-    return parser.parse_args()
+    ap = argparse.ArgumentParser("Train a simple multimodal iDBN (image) + joint RBM with label softmax")
+    ap.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    return ap.parse_args()
 
 
-def load_config(config_path: Path = DEFAULT_CONFIG_PATH) -> dict:
-    if not config_path.exists():
-        raise FileNotFoundError(f"Multimodal config not found at {config_path}")
-    with config_path.open("r") as fp:
-        return yaml.safe_load(fp)
+def load_config(path: Path) -> dict:
+    with path.open("r") as f:
+        return yaml.safe_load(f)
 
 
 def build_params(cfg: dict) -> dict:
-    training_cfg = cfg.get("training", {})
-    paths_cfg = cfg.get("paths", {})
-    wandb_cfg = cfg.get("wandb", {})
+    t = cfg.get("training", {})
+    return {
+        # shared (immagine)
+        "LEARNING_RATE": t.get("learning_rate", 0.1),
+        "WEIGHT_PENALTY": t.get("weight_penalty", 1e-4),
+        "INIT_MOMENTUM": t.get("init_momentum", 0.5),
+        "FINAL_MOMENTUM": t.get("final_momentum", 0.95),
+        "LEARNING_RATE_DYNAMIC": t.get("learning_rate_dynamic", True),
+        "CD": t.get("cd", 1),
 
-    params = {
-        "LEARNING_RATE": training_cfg.get("learning_rate", 0.1),
-        "WEIGHT_PENALTY": training_cfg.get("weight_penalty", 0.0001),
-        "INIT_MOMENTUM": training_cfg.get("init_momentum", 0.5),
-        "FINAL_MOMENTUM": training_cfg.get("final_momentum", 0.95),
-        "LEARNING_RATE_DYNAMIC": training_cfg.get("learning_rate_dynamic", True),
-        "CD": training_cfg.get("cd", 1),
-        "EPOCHS": training_cfg.get("epochs_image", 100),
-        "EPOCHS TEXT": training_cfg.get("epochs_text", 30),
-        "EPOCHS JOINT": training_cfg.get("epochs_joint", 200),
-        "LOG_EVERY_PCA": training_cfg.get("log_every_pca", 10),
-        "LOG_EVERY_PROBE": training_cfg.get("log_every_probe", training_cfg.get("log_every_pca", 10)),
-        "W_REC": training_cfg.get("w_rec", 1.0),
-        "W_SUP": training_cfg.get("w_sup", 1.0),
-        "JOINT_CD": training_cfg.get("joint_cd", training_cfg.get("cd", 1)),
-        "CROSS_GIBBS_STEPS": training_cfg.get("cross_gibbs_steps", 10),
-        "TEXT_LEARNING_RATE": training_cfg.get("text_learning_rate", training_cfg.get("learning_rate", 0.1)),
-        "JOINT_LEARNING_RATE": training_cfg.get("joint_learning_rate", training_cfg.get("learning_rate", 0.1)),
-        # Auxiliary clamped-CD controls
-        "JOINT_AUX_EVERY_K": training_cfg.get("joint_aux_every_k", 2),
-        "JOINT_AUX_CD": training_cfg.get("joint_aux_cd", 1),
-        "JOINT_AUX_COND_STEPS": training_cfg.get("joint_aux_cond_steps", 25),
-        "JOINT_AUX_LR_SCALE": training_cfg.get("joint_aux_lr_scale", 0.2),
-        "SAVE_PATH": paths_cfg.get("save_dir", "networks/zipfian/imdbn"),
-        "SAVE_NAME": paths_cfg.get("save_name", "imdbn_trained"),
-        "ENABLE_WANDB": wandb_cfg.get("enable", False),
-        "WANDB_PROJECT": wandb_cfg.get("project"),
-        "WANDB_ENTITY": wandb_cfg.get("entity"),
-        "WANDB_RUN_NAME": wandb_cfg.get("run_name"),
-        # Label feature enrichments for TextRBMEncoder
-        "LABEL_SMOOTH_SIGMA": cfg.get("model", {}).get("label_smooth_sigma", 0.0),
-        "INCLUDE_LABEL_SCALAR": cfg.get("model", {}).get("include_label_scalar", False),
-        "LABEL_FOURIER_K": cfg.get("model", {}).get("label_fourier_k", 0),
+        # epochs
+        "EPOCHS_IMG": t.get("epochs_image", 100),
+        "EPOCHS_JOINT": t.get("epochs_joint", 200),
+
+        # joint
+        "JOINT_LEARNING_RATE": t.get("joint_learning_rate", t.get("learning_rate", 0.1)),
+        "JOINT_CD": t.get("joint_cd", t.get("cd", 1)),
+        "CROSS_GIBBS_STEPS": t.get("cross_gibbs_steps", 50),
+
+        # aux clamped-CD
+        "USE_AUX": t.get("use_aux", True),
+        "JOINT_AUX_COND_STEPS": t.get("JOINT_AUX_COND_STEPS", t.get("aux_cond_steps", 50)),
+        "JOINT_AUX_EVERY_K": t.get("JOINT_AUX_EVERY_K", 10),
+        # logging
+        "LOG_EVERY": t.get("log_every", 5),
+        "LOG_EVERY_PCA": t.get("log_every_pca", 25),
+        "LOG_EVERY_PROBE": t.get("log_every_probe", 10),
     }
-    return params
 
 
-def initialise_wandb(params: dict, cfg: dict):
-    if not params.get("ENABLE_WANDB", False):
+def maybe_wandb(cfg: dict, params: dict):
+    wcfg = cfg.get("wandb", {})
+    if not wcfg.get("enable", False): 
         return None
-
-    wandb_kwargs = {"project": params.get("WANDB_PROJECT", "groundeep-diagnostics")}
-    entity = params.get("WANDB_ENTITY")
-    if entity:
-        wandb_kwargs["entity"] = entity
-    run_name = params.get("WANDB_RUN_NAME")
-    if run_name:
-        wandb_kwargs["name"] = run_name
-
-    wandb_config = {
-        "training": cfg.get("training", {}),
-        "model": cfg.get("model", {}),
-        "dataset": cfg.get("dataset", {}),
-        "paths": cfg.get("paths", {}),
-    }
-
-    return wandb.init(config=wandb_config, **wandb_kwargs)
+    run = wandb.init(
+        project=wcfg.get("project", "groundeep-diagnostics-multimodal"),
+        entity=wcfg.get("entity"),
+        name=wcfg.get("run_name"),
+        config=cfg,            # << logga l’intera YAML
+    )
+    # aggiungi anche i parametri “build_params”
+    run.config.update({"_derived_params": params}, allow_val_change=True)
+    return run
 
 
-def main(config_path: Path = DEFAULT_CONFIG_PATH):
-    cfg = load_config(config_path)
 
-    dataset_cfg = cfg.get("dataset", {})
-    model_cfg = cfg.get("model", {})
+def main():
+    args = parse_args()
+    cfg = load_config(args.config)
 
+    dataset = cfg.get("dataset", {})
+    model = cfg.get("model", {})
     params = build_params(cfg)
 
-    layer_sizes_img = model_cfg.get("image_layers", [10000, 1500, 500])
-    layer_sizes_txt = model_cfg.get("text_layers", [64, 256])
-    joint_layer_size = model_cfg.get("joint_hidden", 1000)
-    text_posenc_dim = model_cfg.get("text_posenc_dim", 32)
-
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    train_loader, val_loader, test_loader = create_dataloaders_uniform(
-        data_path=dataset_cfg.get("path", "stimuli_dataset_adaptive_auto"),
-        data_name=dataset_cfg.get("name", "stimuli_dataset.npz"),
-        batch_size=dataset_cfg.get("batch_size", 128),
-        num_workers=dataset_cfg.get("num_workers", 1),
-        multimodal_flag=dataset_cfg.get("multimodal_flag", True),
+    train_loader, val_loader, _ = create_dataloaders_uniform(
+        data_path=dataset.get("path"),
+        data_name=dataset.get("name"),
+        batch_size=dataset.get("batch_size", 128),
+        num_workers=dataset.get("num_workers", 1),
+        multimodal_flag=dataset.get("multimodal_flag", True),
     )
 
-    save_dir = Path(params["SAVE_PATH"]).expanduser().resolve()
-    save_dir.mkdir(parents=True, exist_ok=True)
+    wandb_run = maybe_wandb(cfg,params)
+    if wandb_run:
+    # salva la config usata come file nel run
+        wandb.save(str(args.config))  # la vedi nei "Files"
 
-    save_path = save_dir / (
-        f"{params['SAVE_NAME']}"
-        f"_IMG{'-'.join(map(str, layer_sizes_img))}"
-        f"_TXT{'-'.join(map(str, layer_sizes_txt))}"
-        f"_JOINT{joint_layer_size}.pkl"
-    )
-
-    wandb_run = initialise_wandb(params, cfg)
-
+    # Istanza modello multimodale
     imdbn = iMDBN(
-        layer_sizes_img, layer_sizes_txt, joint_layer_size,
-        params, train_loader, val_loader, device,
-        text_posenc_dim=text_posenc_dim,
-        wandb_run=wandb_run
+        layer_sizes_img=model.get("image_layers", [10000, 1500, 1500]),
+        joint_layer_size=model.get("joint_hidden", 1000),
+        params=params,
+        dataloader=train_loader,
+        val_loader=val_loader,
+        device=device,
+        num_labels=model.get("num_labels", 32),
+        wandb_run=wandb_run,
     )
 
-    # Optionally load a pre-trained image iDBN
+    # 1) iDBN visiva: carica se disponibile, altrimenti allena
     image_pre = cfg.get("paths", {}).get("image_idbn_pretrained")
     if image_pre:
-        import pickle
-        try:
-            with open(image_pre, 'rb') as f:
-                loaded = pickle.load(f)
-            imdbn.image_idbn = loaded
-            print(f"Loaded pre-trained image iDBN from {image_pre}")
-        except Exception as e:
-            print(f"Warning: failed to load pre-trained image iDBN from {image_pre}: {e}. Falling back to training.")
-            print("Training image iDBN...")
-            imdbn.image_idbn.train(params["EPOCHS"])
+        ok = imdbn.load_pretrained_image_idbn(image_pre)
+        if not ok:
+            print("[main] fallback: training image iDBN da zero...")
+            imdbn.image_idbn.train(params["EPOCHS_IMG"],
+                                   log_every_pca=params["LOG_EVERY_PCA"],
+                                   log_every_probe=params["LOG_EVERY_PROBE"])
     else:
         print("Training image iDBN...")
-        imdbn.image_idbn.train(params["EPOCHS"])
-        imdbn.image_idbn.save_model(str(save_path / "image_idbn_.pkl"))
+        imdbn.image_idbn.train(params["EPOCHS_IMG"],
+                               log_every_pca=params["LOG_EVERY_PCA"],
+                               log_every_probe=params["LOG_EVERY_PROBE"])
 
-    print("Training text iDBN...")
-    imdbn.text_encoder.train(params["EPOCHS TEXT"])
+    # (opzionale) fine-tuning ultimo RBM immagine
+    ft_epochs = int(cfg.get("paths", {}).get("image_idbn_finetune_last_epochs", 0))
+    if ft_epochs > 0:
+        imdbn.finetune_image_last_layer(epochs=ft_epochs, lr_scale=0.3)
 
+    # 2) Joint (autorecon first + condizionali via aux) + logging completo
     print("Training joint RBM...")
-    imdbn.train_joint(
-        epochs=params["EPOCHS JOINT"],
-        log_every_pca=params.get("LOG_EVERY_PCA", 10),
-        log_every_probe=params.get("LOG_EVERY_PROBE", 10),
-        w_rec=params.get("W_REC", 1.0),
-        w_sup=params.get("W_SUP", 1.0),
-    )
+    imdbn.train_joint(epochs=params["EPOCHS_JOINT"],
+                      log_every=params["LOG_EVERY"],
+                      log_every_pca=params["LOG_EVERY_PCA"],
+                      log_every_probe=params["LOG_EVERY_PROBE"])
 
+    # Save
+    save_dir = Path(cfg.get("paths", {}).get("save_dir", "./networks")).expanduser()
+    save_dir.mkdir(parents=True, exist_ok=True)
+    save_path = save_dir / f"{cfg.get('paths', {}).get('save_name', 'imdbn_trained')}.pkl"
     imdbn.save_model(str(save_path))
-    print(f"✅ Saved trained multimodal DBN to {save_path}")
+    print(f"✅ Saved multimodal model to {save_path}")
 
-    if wandb_run is not None:
-        wandb_run.finish()
+    if wandb_run: wandb_run.finish()
 
 
 if __name__ == "__main__":
-    args = parse_args()
-    main(args.config)
+    main()

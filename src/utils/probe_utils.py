@@ -19,87 +19,118 @@ except Exception:
 # -------------------------
 @torch.no_grad()
 def compute_val_embeddings_and_features(model, upto_layer: int | None = None) -> tuple[torch.Tensor, dict]:
-    """
-    Calcola:
-      - E: tensor [N, D] con gli embeddings del validation set (NO shuffle nel val_loader!)
-      - feats: dict con:
-          'cum_area'    -> Tensor[N] float
-          'convex_hull' -> Tensor[N] float
-          'labels'      -> Tensor[N] (float/int) che verrà binnato
-    Requisiti del `model`:
-      - model.val_loader (no shuffle)
-      - model.text_flag (sceglie batch_data vs labels)
-      - model.device
-      - model.represent(x) -> embeddings [B, D]
-      - model.features con chiavi "Cumulative Area", "Convex Hull", "Labels"
-      - model.arch_dir (per salvare CSV)
-    """
     assert model.val_loader is not None, "val_loader is None."
 
     embeds = []
     for batch_data, batch_labels in model.val_loader:
-        x = (batch_data.to(model.device) if not model.text_flag else batch_labels.to(model.device))
+        x = (batch_data.to(model.device) if not getattr(model, "text_flag", False) else batch_labels.to(model.device))
         x = x.view(x.size(0), -1).float()
-        if upto_layer is None:
-            z = model.represent(x)  # [B, D]
-        else:
-            z = model.represent(x, upto_layer=upto_layer)
+        z = model.represent(x) if upto_layer is None else model.represent(x, upto_layer=upto_layer)
         embeds.append(z.detach().cpu())
     E = torch.cat(embeds, dim=0)  # [N, D]
 
-    cum_area = model.features["Cumulative Area"].view(-1).cpu()
-    chull    = model.features["Convex Hull"].view(-1).cpu()
-    labels   = model.features["Labels"].view(-1).cpu()
-    density_feat = model.features.get("Density")
-    density = density_feat.view(-1).cpu() if density_feat is not None else None
+    # --- helper per trovare la chiave ignorando spazi/maiuscole ---
+    def _get_feat(d: dict, *candidates):
+        norm = {k.lower().replace(" ", "").replace("_", ""): k for k in d.keys()}
+        for c in candidates:
+            key = norm.get(c.lower().replace(" ", "").replace("_", ""))
+            if key is not None:
+                return d[key]
+        return None
+
+    feats_src = getattr(model, "features", None)
+    if feats_src is None:
+        raise RuntimeError("model.features is required")
+
+    cum_area_t = _get_feat(feats_src, "Cumulative Area", "cum_area")
+    chull_t    = _get_feat(feats_src, "Convex Hull", "convex_hull", "convexhull")
+    labels_t   = _get_feat(feats_src, "Labels", "labels")
+    density_t  = _get_feat(feats_src, "Density", "density")
+
+    # --- normalizza forme/dtype ---
+    def _to_1d_float(t):
+        if t is None:
+            return None
+        t = torch.as_tensor(t)
+        # se è one-hot [N,K] → indici 0..K-1
+        if t.ndim == 2:
+            t = torch.argmax(t, dim=1)
+        return t.view(-1).to(torch.float32).cpu()
+
+    cum_area = _to_1d_float(cum_area_t)
+    chull    = _to_1d_float(chull_t)
+    labels   = _to_1d_float(labels_t)
+    density  = _to_1d_float(density_t)
 
     n = E.size(0)
-    if cum_area.numel() != n or chull.numel() != n or labels.numel() != n:
-        raise RuntimeError(
-            f"Dimension mismatch: embeddings={n}, cum_area={cum_area.numel()}, "
-            f"convex_hull={chull.numel()}, labels={labels.numel()}."
-        )
+    def _check(name, v):
+        if v is None:
+            return False
+        if v.numel() != n:
+            # taglia o ripete per sicurezza, ma meglio segnalare
+            raise RuntimeError(f"Feature '{name}' length mismatch: {v.numel()} vs embeddings {n}.")
+        return True
 
-    if density is not None and density.numel() != n:
-        raise RuntimeError(
-            f"Dimension mismatch: embeddings={n}, density={density.numel()}."
-        )
+    feats = {}
+    if _check("cum_area", cum_area): feats["cum_area"] = cum_area
+    if _check("convex_hull", chull): feats["convex_hull"] = chull
+    if _check("labels", labels):     feats["labels"] = labels
+    if density is not None and _check("density", density): feats["density"] = density
 
-    feats = {"cum_area": cum_area, "convex_hull": chull, "labels": labels}
-    if density is not None:
-        feats["density"] = density
     return E, feats
 
-
+@torch.no_grad()
 @torch.no_grad()
 def compute_joint_embeddings_and_features(model) -> tuple[torch.Tensor, dict]:
-    """Compute joint embeddings (image + text) for a multimodal model."""
     assert model.val_loader is not None, "val_loader is None."
 
     embeds = []
     for img_data, labels in model.val_loader:
-        img = img_data.to(model.device)
-        labs = labels.to(model.device)
-        z = model.represent((img, labs))
+        z = model.represent((img_data.to(model.device), labels.to(model.device)))
         embeds.append(z.detach().cpu())
-
     if not embeds:
         return torch.empty(0), {}
 
     E = torch.cat(embeds, dim=0)
 
-    feats_src = getattr(model, 'features', None)
+    feats_src = getattr(model, "features", None)
     if feats_src is None:
-        raise RuntimeError("Model.features is required for joint linear probe.")
+        raise RuntimeError("model.features is required")
 
-    feats = {
-        "cum_area": feats_src["Cumulative Area"].view(-1).cpu(),
-        "convex_hull": feats_src["Convex Hull"].view(-1).cpu(),
-        "labels": feats_src["Labels"].view(-1).cpu(),
-    }
-    density = feats_src.get("Density") if isinstance(feats_src, dict) else None
-    if density is not None:
-        feats["density"] = density.view(-1).cpu()
+    def _get_feat(d: dict, *candidates):
+        norm = {k.lower().replace(" ", "").replace("_", ""): k for k in d.keys()}
+        for c in candidates:
+            key = norm.get(c.lower().replace(" ", "").replace("_", ""))
+            if key is not None:
+                return d[key]
+        return None
+
+    def _to_1d_float(t):
+        if t is None:
+            return None
+        t = torch.as_tensor(t)
+        if t.ndim == 2:  # one-hot
+            t = torch.argmax(t, dim=1)
+        return t.view(-1).to(torch.float32).cpu()
+
+    cum_area = _to_1d_float(_get_feat(feats_src, "Cumulative Area", "cum_area"))
+    chull    = _to_1d_float(_get_feat(feats_src, "Convex Hull", "convex_hull", "convexhull"))
+    labels   = _to_1d_float(_get_feat(feats_src, "Labels", "labels"))
+    density  = _to_1d_float(_get_feat(feats_src, "Density", "density"))
+
+    n = E.size(0)
+    def _check(name, v):
+        if v is None:
+            return False
+        if v.numel() != n:
+            raise RuntimeError(f"Feature '{name}' length mismatch: {v.numel()} vs embeddings {n}.")
+        return True
+
+    feats = {}
+    if _check("cum_area", cum_area): feats["cum_area"] = cum_area
+    if _check("convex_hull", chull): feats["convex_hull"] = chull
+    if _check("labels", labels):     feats["labels"] = labels
+    if density is not None and _check("density", density): feats["density"] = density
 
     return E, feats
 
@@ -411,7 +442,7 @@ def log_joint_linear_probe(
     rng_seed: int = 42,
     patience: int = 20,
     min_delta: float = 0.0,
-    save_csv: bool = True,
+    save_csv: bool = False,
     metric_prefix: str = "joint",
 ):
     """Linear probe for multimodal joint embeddings (image & text)."""
