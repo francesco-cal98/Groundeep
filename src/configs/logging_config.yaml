@@ -1,0 +1,15 @@
+logging:
+  pca_trajectory:
+    # Frames sampled from the trajectory for the recon panel (including start)
+    n_frames: 8
+    # Scatter style for the embedding cloud
+    scatter_size: 12
+    scatter_alpha: 0.35
+    # 3D specific options
+    three_d:
+      enable_panel: true
+      elev: 20      # view elevation for 3D plot
+      azim: 35      # view azimuth for 3D plot
+      scatter_size: 6
+      scatter_alpha: 0.15
+

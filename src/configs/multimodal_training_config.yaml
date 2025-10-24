@@ -6,7 +6,7 @@ dataset:
   multimodal_flag: true
 
 model:
-  image_layers: [10000, 1500, 1500]   # se carichi un pretrained con top=500, il joint si adatta
+  image_layers: [10000, 1500, 500]   # se carichi un pretrained con top=500, il joint si adatta
   joint_hidden: 500
   num_labels: 32
 
@@ -21,17 +21,17 @@ training:
   epochs_image: 100
 
   # Joint (semplice)
-  joint_learning_rate: 0.1
-  joint_cd: 20
+  joint_learning_rate: 0.04
+  joint_cd: 5
   epochs_joint: 200
 
   # Cross-modality (sampling length)
-  cross_gibbs_steps: 30
+  cross_gibbs_steps: 72
 
   # Aux clamped-CD (on/off)
   use_aux: true
-  JOINT_AUX_COND_STEPS: 5
-  JOINT_AUX_EVERY_K: 50
+  JOINT_AUX_COND_STEPS: 50
+  JOINT_AUX_EVERY_K: 15
 
   # Logging
   log_every: 5
