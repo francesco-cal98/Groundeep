@@ -1,5 +1,10 @@
-# src/main_scripts/train.py
+"""
+Minimal training entrypoint.
+- Reads a YAML config (default: src/configs/training_config.yaml)
+- Trains iDBN or gDBN according to `algorithm`
+"""
 
+import argparse
 import torch
 import os
 import yaml
@@ -10,23 +15,32 @@ import sys
 # === PATH SETUP ===
 current_dir = os.getcwd()
 project_root = os.path.abspath(os.path.join(current_dir, '..', '..'))
-sys.path.append(project_root)
-sys.path.append(current_dir) # Add current_dir if it contains other necessary modules
+if project_root not in sys.path:
+    sys.path.append(project_root)
+if current_dir not in sys.path:
+    sys.path.append(current_dir)
 
 from src.classes.gdbn_model import gDBN, iDBN
-from src.datasets.uniform_dataset import create_dataloaders_uniform, create_dataloaders_zipfian
+from src.datasets.uniform_dataset import create_dataloaders_uniform
 
 
-def run_training():
+def _parse_args():
+    ap = argparse.ArgumentParser("Train DBN/iDBN from YAML config")
+    ap.add_argument("--config", type=Path, default=Path("src/configs/training_config.yaml"))
+    return ap.parse_args()
+
+
+def run_training(config_path: Path | None = None):
     """
-    Script principale per l'addestramento del modello.
-    Legge la configurazione e avvia il processo di training.
+    Main training function. Accepts an optional config_path for reuse from wrappers.
     """
-    
-    config_path = Path("src/configs/training_config.yaml")
-    if not config_path.exists():
+    if config_path is None:
+        args = _parse_args()
+        config_path = args.config
+
+    if not Path(config_path).exists():
         raise FileNotFoundError(f"Config file not found at {config_path}")
-        
+
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
@@ -45,18 +59,18 @@ def run_training():
         "SAVE_NAME": config['save_name'],
     }
     layer_sizes_list = config['layer_sizes_list']
-    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    train_loader, val_loader, test_loader = create_dataloaders_uniform(
+    train_loader, val_loader, _ = create_dataloaders_uniform(
         data_path=config['dataset_path'],
         data_name=config['dataset_name'],
         batch_size=config['batch_size'],
         num_workers=config['num_workers'],
         multimodal_flag=config['multimodal_flag']
     )
-    
+
     wandb_run = wandb.init(project="groundeep-diagnostics")
 
     for layer_sizes in layer_sizes_list:
@@ -67,14 +81,14 @@ def run_training():
 
         if params["ALGORITHM"] == "g":
             dbn = gDBN(
-                layer_sizes=[10000] + layer_sizes, 
-                params=params, 
-                dataloader=train_loader, 
+                layer_sizes=[10000] + layer_sizes,
+                params=params,
+                dataloader=train_loader,
                 device=device
-            )                 
+            )
             dbn.train(epochs=params["EPOCHS"])
             dbn.save(save_path)
-            
+
         elif params["ALGORITHM"] == "i":
             dbn = iDBN(
                 layer_sizes=[10000] + layer_sizes,
@@ -89,6 +103,7 @@ def run_training():
             dbn.save_model(save_path)
 
     print("✅ Training complete for all architectures.")
+
 
 if __name__ == "__main__":
     run_training()

@@ -43,6 +43,8 @@ def build_params(cfg: dict) -> dict:
         # joint
         "JOINT_LEARNING_RATE": t.get("joint_learning_rate", t.get("learning_rate", 0.1)),
         "JOINT_CD": t.get("joint_cd", t.get("cd", 1)),
+        "JOINT_LR_Y_SCALE": t.get("JOINT_LR_Y_SCALE", 0.5),
+        "JOINT_WD_Y_SCALE": t.get("JOINT_WD_Y_SCALE", 2.0),
         "CROSS_GIBBS_STEPS": t.get("cross_gibbs_steps", 50),
 
         # aux clamped-CD

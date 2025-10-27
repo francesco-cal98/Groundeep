@@ -89,6 +89,8 @@ class RBM(nn.Module):
         self.W_m = torch.zeros_like(self.W)
         self.hb_m = torch.zeros_like(self.hid_bias)
         self.vb_m = torch.zeros_like(self.vis_bias)
+        # persistent chains for PCD
+        self._pcd_v: Optional[torch.Tensor] = None
 
     # RBM.forward
     def forward(self, v: torch.Tensor, T: float = 1.0) -> torch.Tensor:
@@ -138,38 +140,114 @@ class RBM(nn.Module):
         v_next = self.sample_visible(v_prob) if sample_v else v_prob
         return v_next, v_prob, h, h_prob
 
-    # ---- CD-k
+    # ---- CD-k (supports PCD + y-block scaling for joint RBM)
     @torch.no_grad()
-    def train_epoch(self, data: torch.Tensor, epoch: int, max_epochs: int, CD: int = 1):
+    def train_epoch(
+        self,
+        data: torch.Tensor,
+        epoch: int,
+        max_epochs: int,
+        CD: int = 1,
+        use_pcd: bool = True,
+        clip_w: Optional[float] = None,
+        clip_b: Optional[float] = None,
+    ):
         lr = self.lr / (1 + 0.01 * epoch) if self.dynamic_lr else self.lr
         mom = self.momentum if epoch <= 5 else self.final_momentum
-        bsz = data.size(0)
+        B = data.size(0)
 
         # positive
         pos_h = self.forward(data)
         pos_assoc = data.T @ pos_h
 
-        # negative
-        h = (pos_h > torch.rand_like(pos_h)).float()
+        # negative: PCD chains if available (robust to varying batch sizes)
+        V = int(self.num_visible)
+        if use_pcd and (self._pcd_v is not None) and (self._pcd_v.size(1) == V):
+            if self._pcd_v.size(0) >= B:
+                v = self._pcd_v[:B].clone()
+            else:
+                # expand with fresh random rows to match current batch size
+                extra = torch.rand(B - self._pcd_v.size(0), V, device=data.device)
+                v = torch.cat([self._pcd_v, extra], dim=0).clone()
+        else:
+            v = torch.rand(B, V, device=data.device)
         for _ in range(int(CD)):
-            v_prob = self.visible_probs(h)
-            v = self.sample_visible(v_prob)
             h_prob = self.forward(v)
             h = (h_prob > torch.rand_like(h_prob)).float()
+            v_prob = self.visible_probs(h)
+            v = self.sample_visible(v_prob)
+        # persist/update chains buffer
+        if use_pcd:
+            if self._pcd_v is None or self._pcd_v.size(1) != V:
+                self._pcd_v = v.detach()
+            else:
+                if self._pcd_v.size(0) >= B:
+                    self._pcd_v[:B] = v.detach()
+                else:
+                    self._pcd_v = v.detach()
         neg_assoc = v.T @ h_prob
 
-        # updates
-        self.W_m.mul_(mom).add_(lr * ((pos_assoc - neg_assoc) / bsz - self.weight_decay * self.W))
-        self.W.add_(self.W_m)
+        # raw grads
+        W_posneg = (pos_assoc - neg_assoc) / B
+        dhb = (pos_h.sum(0) - h_prob.sum(0)) / B
+        dvb = (data.sum(0) - v.sum(0)) / B
 
-        self.hb_m.mul_(mom).add_(lr * (pos_h.sum(0) - h_prob.sum(0)) / bsz)
-        if self.sparsity:
-            Q = pos_h.mean(0)
-            self.hb_m.add_(-lr * (Q - self.sparsity_factor))
-        self.hid_bias.add_(self.hb_m)
+        # If this RBM is the joint (z⊕y), scale y-block LR/WD separately
+        if hasattr(self, "Dz_img") and hasattr(self, "num_labels"):
+            Dz = int(self.Dz_img)
+            K = int(self.num_labels)
+            lr_z = lr
+            lr_y = float(getattr(self, "lr_y", lr * 0.5))
+            wd_y = float(getattr(self, "wd_y", self.weight_decay * 2.0))
 
-        self.vb_m.mul_(mom).add_(lr * (data.sum(0) - v.sum(0)) / bsz)
-        self.vis_bias.add_(self.vb_m)
+            dW = torch.empty_like(self.W)
+            # z block
+            dW[:Dz, :] = lr_z * (W_posneg[:Dz, :] - self.weight_decay * self.W[:Dz, :])
+            # y block (slower LR, stronger WD)
+            dW[Dz:Dz+K, :] = lr_y * (W_posneg[Dz:Dz+K, :] - wd_y * self.W[Dz:Dz+K, :])
+            # optional clipping
+            if clip_w is not None:
+                dW.clamp_(-float(clip_w), float(clip_w))
+
+            self.W_m.mul_(mom).add_(dW)
+            self.W.add_(self.W_m)
+
+            # biases: hidden as usual
+            upd_hb = lr * dhb
+            if clip_b is not None:
+                upd_hb = upd_hb.clamp(-float(clip_b), float(clip_b))
+            self.hb_m.mul_(mom).add_(upd_hb)
+            if self.sparsity:
+                Q = pos_h.mean(0)
+                self.hb_m.add_(-lr * (Q - self.sparsity_factor))
+            self.hid_bias.add_(self.hb_m)
+
+            # visible bias split
+            vb_update = torch.empty_like(self.vis_bias)
+            vb_update[:Dz] = lr * (dvb[:Dz] - self.weight_decay * self.vis_bias[:Dz])
+            vb_update[Dz:Dz+K] = lr_y * (dvb[Dz:Dz+K] - wd_y * self.vis_bias[Dz:Dz+K])
+            if clip_b is not None:
+                vb_update = vb_update.clamp(-float(clip_b), float(clip_b))
+            self.vb_m.mul_(mom).add_(vb_update)
+            self.vis_bias.add_(self.vb_m)
+        else:
+            # generic RBM update
+            dW = W_posneg - self.weight_decay * self.W
+            if clip_w is not None:
+                dW = dW.clamp(-float(clip_w), float(clip_w))
+            self.W_m.mul_(mom).add_(lr * dW)
+            self.W.add_(self.W_m)
+
+            upd_hb = lr * dhb
+            upd_vb = lr * dvb
+            if clip_b is not None:
+                upd_hb = upd_hb.clamp(-float(clip_b), float(clip_b))
+                upd_vb = upd_vb.clamp(-float(clip_b), float(clip_b))
+            if self.sparsity:
+                Q = pos_h.mean(0)
+                upd_hb = upd_hb + (-lr * (Q - self.sparsity_factor))
+            self.hb_m.mul_(mom).add_(upd_hb); self.hid_bias.add_(self.hb_m)
+            self.vb_m.mul_(mom).add_(upd_vb); self.vis_bias.add_(self.vb_m)
 
         loss = torch.mean((data - v_prob) ** 2)
         return loss
@@ -690,13 +768,18 @@ class iMDBN(nn.Module):
         self.joint_rbm = RBM(
             num_visible=self.Dz_img + K,
             num_hidden=int(joint_hidden),
-            learning_rate=self.params.get("JOINT_LEARNING_RATE", self.params.get("LEARNING_RATE", 0.1)),
+            learning_rate=self.params.get("JOINT_LEARNING_RATE", 1e-3),
             weight_decay=self.params.get("WEIGHT_PENALTY", 0.0001),
             momentum=self.params.get("INIT_MOMENTUM", 0.5),
             dynamic_lr=self.params.get("LEARNING_RATE_DYNAMIC", True),
             final_momentum=self.params.get("FINAL_MOMENTUM", 0.95),
             softmax_groups=[(self.Dz_img, self.Dz_img + K)],
         ).to(self.device)
+        # joint-specific scales for y-block
+        self.joint_rbm.Dz_img = self.Dz_img
+        self.joint_rbm.num_labels = self.num_labels
+        self.joint_rbm.lr_y = self.joint_rbm.lr * float(self.params.get("JOINT_LR_Y_SCALE", 0.5))
+        self.joint_rbm.wd_y = self.joint_rbm.weight_decay * float(self.params.get("JOINT_WD_Y_SCALE", 2.0))
 
     
     # ---- init bias visibili del joint
@@ -713,6 +796,7 @@ class iMDBN(nn.Module):
         Dz = self.Dz_img
         K = self.num_labels
         sum_z = None
+        sumsq_z = None
         n = 0
         class_counts = torch.zeros(K, device=self.device)
         for b, (imgs, lbls) in enumerate(self.dataloader):
@@ -721,11 +805,14 @@ class iMDBN(nn.Module):
             v = imgs.to(self.device).view(imgs.size(0), -1).float()
             z = self.image_idbn.represent(v)
             sum_z = z.sum(0) if sum_z is None else (sum_z + z.sum(0))
+            sumsq_z = (z * z).sum(0) if sumsq_z is None else (sumsq_z + (z * z).sum(0))
             n += z.size(0)
             class_counts += lbls.to(self.device).float().sum(0)
         if n == 0:
             return
         mean_z = (sum_z / n).clamp(1e-4, 1 - 1e-4)
+        var_z = (sumsq_z / n) - (mean_z * mean_z)
+        std_z = var_z.clamp_min(1e-9).sqrt()
         priors = class_counts / max(1, class_counts.sum())
         priors = (priors + 1e-6) / (priors.sum() + 1e-6 * K)
         try:
@@ -760,6 +847,13 @@ class iMDBN(nn.Module):
         
         self.joint_rbm.vis_bias[:Dz] = torch.log(mean_z) - torch.log1p(-mean_z)
         self.joint_rbm.vis_bias[Dz : Dz + K] = torch.log(priors)
+
+        # Gain control reference (from encoder statistics)
+        self.z_enc_mean = mean_z.detach()
+        self.z_enc_std = std_z.detach().clamp_min(1e-3)
+        # Affine parameters to align joint z to encoder space (EMA-updated)
+        self.z_affine_scale = torch.ones_like(self.z_enc_std, device=self.device)
+        self.z_affine_bias = torch.zeros_like(self.z_enc_mean, device=self.device)
 
     # ---- load iDBN pre-allenata
     def load_pretrained_image_idbn(self, path: str) -> bool:
@@ -845,58 +939,39 @@ class iMDBN(nn.Module):
         v_img2txt = self.joint_rbm.conditional_gibbs(v_known, km, n_steps=steps, sample_h=False, sample_v=False)
         p_y_given_img = v_img2txt[:, Dz:]
 
-        # TXT -> IMG (noisy MF + μ-pull + best-of-K)
-        v_known.zero_(); km.zero_()
-        v_known[:, Dz:] = y_onehot
-        km[:, Dz:] = 1.0
+        # TXT -> IMG (stochastic Gibbs hot window then mean-field; y clamped)
+        steps = steps or self.cross_steps
+        hot_len = min(20, max(10, steps // 3))
+        cold_len = max(0, steps - hot_len)
 
-        # init informata con μ_k, se disponibile
-        use_mu = hasattr(self, "z_class_mean") and self.z_class_mean is not None
-        if use_mu:
-            y_idx = y_onehot.argmax(dim=1)
-            mu_k = self.z_class_mean[y_idx]  # [B, Dz]
-            # abilita μ-pull nel RBM durante l'annealing
-            self.joint_rbm._mu_pull = {"mu_k": mu_k, "eta0": 0.15}
-        else:
-            self.joint_rbm._mu_pull = None
+        # init z random with weak mu-pull
+        z = torch.rand(B, Dz, device=self.device)
+        if hasattr(self, "z_class_mean") and self.z_class_mean is not None:
+            mu = self.z_class_mean[y_onehot.argmax(dim=1)]
+            eta0 = 0.08
+            z = (1 - eta0) * z + eta0 * mu
 
-        # catena principale
-        v_chain = self.joint_rbm.noisy_meanfield_annealed(
-            v_known=v_known, known_mask=km,
-            n_steps=steps, T0=3.0, T1=1.0, sigma0=0.9, hot_frac=0.7,
-            sharpen_last=3, T_cold_plus=0.9
-        )
+        # hot stochastic window
+        for _ in range(int(hot_len)):
+            h_prob = self.joint_rbm.forward(torch.cat([z, y_onehot], dim=1))
+            h = (h_prob > torch.rand_like(h_prob)).float()
+            v_prob = self.joint_rbm.visible_probs(h)
+            v_prob[:, Dz:] = y_onehot
+            v_sample = self.joint_rbm.sample_visible(v_prob)
+            z = v_sample[:, :Dz]
 
-        # best-of-K “freddo” (cheap): 1-step refinement ripetuto Kbuf volte
-        Kbuf = 5
-        buf_v = [v_chain]
-        buf_F = [self.joint_rbm.free_energy(v_chain) if hasattr(self.joint_rbm, "free_energy") else torch.zeros(B, device=self.device)]
-        for _ in range(Kbuf - 1):
-            v_last = self.joint_rbm.noisy_meanfield_annealed(
-                v_known=buf_v[-1], known_mask=km,
-                n_steps=1, T0=0.9, T1=0.9, sigma0=0.0, hot_frac=0.0, sharpen_last=0, T_cold_plus=0.9
-            )
-            buf_v.append(v_last)
-            if hasattr(self.joint_rbm, "free_energy"):
-                buf_F.append(self.joint_rbm.free_energy(v_last))
-            else:
-                buf_F.append(torch.zeros(B, device=self.device))
+        # cold mean-field window
+        for _ in range(int(cold_len)):
+            h_prob = self.joint_rbm.forward(torch.cat([z, y_onehot], dim=1))
+            v_prob = self.joint_rbm.visible_probs(h_prob)
+            v_prob[:, Dz:] = y_onehot
+            z = v_prob[:, :Dz]
 
-        buf_F = torch.stack(buf_F, dim=0)  # [K,B]
-        best_idx = buf_F.argmin(dim=0)
-        v_pick = torch.stack([buf_v[int(best_idx[b])][b] for b in range(B)], dim=0)
-
-        self.joint_rbm._mu_pull = None  # cleanup
-
-        z_img_from_y_aff = v_pick[:, :Dz]
-
-        # se usi gain-control affine su z, **inversa** qui (altrimenti lascia così)
+        # apply affine gain-control inverse if available
         if hasattr(self, "z_affine_scale") and hasattr(self, "z_affine_bias"):
-            z_img_from_y = (z_img_from_y_aff - self.z_affine_bias) / (self.z_affine_scale + 1e-6)
-        else:
-            z_img_from_y = z_img_from_y_aff
+            z = self.z_affine_scale * z + self.z_affine_bias
 
-        img_from_txt = self.image_idbn.decode(z_img_from_y)
+        img_from_txt = self.image_idbn.decode(z)
         return img_from_txt, p_y_given_img
 
 
@@ -914,7 +989,11 @@ class iMDBN(nn.Module):
         print("[iMDBN] joint training (with warmup y-clamp)")
         self.init_joint_bias_from_data(n_batches=10)
 
-        WARMUP_Y_EPOCHS = 8
+        # Warmup and aux schedule
+        WARMUP_Y_EPOCHS = 3
+        WARMUP_CD_K = 2
+        AUX_PER_BATCH = 2
+        POST_WARMUP_AUX_EPOCHS = 4
         for epoch in tqdm(range(int(epochs)), desc="Joint"):
             cd_losses = []
             totals = {"n": 0, "top1": 0, "top3": 0, "ce_sum": 0.0, "mse_sum": 0.0, "npix": None}
@@ -925,40 +1004,66 @@ class iMDBN(nn.Module):
 
                 with torch.no_grad():
                     z_img = self.image_idbn.represent(img)
-                    v_plus = torch.cat([z_img, y], dim=1)
+                    # binarize z for joint positive phase (straight-through friendly)
+                    z_img_bin = (z_img > 0.5).float()
+                    v_plus = torch.cat([z_img_bin, y], dim=1)
 
                 B, Dz, K = z_img.size(0), self.Dz_img, self.num_labels
                 V = Dz + K
 
                 if epoch < WARMUP_Y_EPOCHS:
-                    # --- Warmup: SOLO y-clamp, 2x per batch, nessun CD libero
-                    for _ in range(2):
+                    # Warmup: only y-clamp, AUX_PER_BATCH times, with stochastic Gibbs
+                    for _ in range(int(AUX_PER_BATCH)):
+                        v_known = torch.zeros(B, V, device=self.device); km = torch.zeros(B, V, device=self.device)
+                        v_known[:, Dz:] = y; km[:, Dz:] = 1.0
+                        _ = self.joint_rbm.train_epoch_clamped(
+                            v_known, km, epoch, epochs,
+                            CD=WARMUP_CD_K, cond_init_steps=50,
+                            sample_h=True, sample_v=True,
+                            reclamp_negative=False,
+                            aux_lr_mult=0.3,
+                            use_noisy_init=True,
+                        )
+                        # online gain-control EMA from a short conditional chain
+                        try:
+                            v_tmp = self.joint_rbm.conditional_gibbs(v_known, km, n_steps=10, sample_h=True, sample_v=True)
+                            z_joint = v_tmp[:, :Dz]
+                            mu_j = z_joint.mean(0)
+                            std_j = z_joint.std(0).clamp_min(1e-3)
+                            alpha = 0.05
+                            self.z_affine_scale.mul_(1 - alpha).add_(alpha * (self.z_enc_std / std_j))
+                            self.z_affine_bias.mul_(1 - alpha).add_(alpha * (self.z_enc_mean - (self.z_affine_scale * mu_j)))
+                        except Exception:
+                            pass
+                else:
+                    # --- Free CD on [z_bin ⊕ y] with PCD and per-block scaling handled in RBM
+                    loss_cd = self.joint_rbm.train_epoch(v_plus, epoch, epochs, CD=self.joint_cd, use_pcd=True)
+                    cd_losses.append(float(loss_cd))
+
+                    # --- Aux y-clamp: keep double AUX for first few epochs post-warmup
+                    aux_reps = AUX_PER_BATCH if epoch < (WARMUP_Y_EPOCHS + POST_WARMUP_AUX_EPOCHS) else 1
+                    for _ in range(int(aux_reps)):
                         v_known = torch.zeros(B, V, device=self.device); km = torch.zeros(B, V, device=self.device)
                         v_known[:, Dz:] = y; km[:, Dz:] = 1.0
                         _ = self.joint_rbm.train_epoch_clamped(
                             v_known, km, epoch, epochs,
                             CD=1, cond_init_steps=50,
                             sample_h=False, sample_v=False,
-                            
+                            reclamp_negative=False,
                             aux_lr_mult=0.3,
                             use_noisy_init=True,
                         )
-                else:
-                    # --- CD "freddo"
-                    loss_cd = self.joint_rbm.train_epoch(v_plus, epoch, epochs, CD=self.joint_cd)
-                    cd_losses.append(float(loss_cd))
-
-                    # --- Aux y-clamp SEMPRE (1x per batch)
-                    v_known = torch.zeros(B, V, device=self.device); km = torch.zeros(B, V, device=self.device)
-                    v_known[:, Dz:] = y; km[:, Dz:] = 1.0
-                    _ = self.joint_rbm.train_epoch_clamped(
-                        v_known, km, epoch, epochs,
-                        CD=1, cond_init_steps=50,
-                        sample_h=False, sample_v=False,
-                        reclamp_negative=False,
-                        aux_lr_mult=0.3,
-                        use_noisy_init=True,
-                    )
+                        # online gain-control EMA
+                        try:
+                            v_tmp = self.joint_rbm.conditional_gibbs(v_known, km, n_steps=10, sample_h=True, sample_v=True)
+                            z_joint = v_tmp[:, :Dz]
+                            mu_j = z_joint.mean(0)
+                            std_j = z_joint.std(0).clamp_min(1e-3)
+                            alpha = 0.05
+                            self.z_affine_scale.mul_(1 - alpha).add_(alpha * (self.z_enc_std / std_j))
+                            self.z_affine_bias.mul_(1 - alpha).add_(alpha * (self.z_enc_mean - (self.z_affine_scale * mu_j)))
+                        except Exception:
+                            pass
 
                     # --- (opzionale) Aux image-clamp ogni ~12 batch
                     if (b_idx % 12) == 0:
@@ -998,6 +1103,19 @@ class iMDBN(nn.Module):
 
             if self.wandb_run and cd_losses:
                 self.wandb_run.log({"joint/cd_loss": float(np.mean(cd_losses)), "epoch": epoch})
+            # ratio Wy/Wz + dynamic LR_y control
+            with torch.no_grad():
+                Dz = self.Dz_img; K = self.num_labels
+                W = self.joint_rbm.W
+                Wy = W[Dz:Dz+K, :]
+                Wz = W[:Dz, :]
+                ratio = (Wy.norm(p='fro') / (Wz.norm(p='fro') + 1e-6)).item()
+                if self.wandb_run:
+                    self.wandb_run.log({"stats/ratio_Wy_Wz": ratio, "epoch": epoch})
+                if ratio > 0.8:
+                    self.joint_rbm.lr_y = max(float(self.joint_rbm.lr_y) * 0.5, 1e-5)
+                    if self.wandb_run:
+                        self.wandb_run.log({"events/lr_y_halved": float(self.joint_rbm.lr_y), "epoch": epoch})
             if self.wandb_run and totals["n"] > 0:
                 top1 = totals["top1"] / totals["n"]
                 top3 = totals["top3"] / totals["n"]

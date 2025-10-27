@@ -7,7 +7,7 @@ dataset:
 
 model:
   image_layers: [10000, 1500, 500]   # se carichi un pretrained con top=500, il joint si adatta
-  joint_hidden: 500
+  joint_hidden: 1000
   num_labels: 32
 
 training:
@@ -21,17 +21,20 @@ training:
   epochs_image: 100
 
   # Joint (semplice)
-  joint_learning_rate: 0.04
-  joint_cd: 5
+  joint_learning_rate: 0.001
+  joint_cd: 2
+  # y-block scaling (optional overrides; defaults 0.5 and 2.0)
+  JOINT_LR_Y_SCALE: 0.5
+  JOINT_WD_Y_SCALE: 2.0
   epochs_joint: 200
 
   # Cross-modality (sampling length)
-  cross_gibbs_steps: 72
+  cross_gibbs_steps: 25
 
   # Aux clamped-CD (on/off)
   use_aux: true
   JOINT_AUX_COND_STEPS: 50
-  JOINT_AUX_EVERY_K: 15
+  JOINT_AUX_EVERY_K: 50
 
   # Logging
   log_every: 5

@@ -1,5 +1,10 @@
-# src/main_scripts/analyze.py
+"""
+Minimal analysis entrypoint.
+- Loads a saved model and runs representational analyses.
+- Accepts --config to point to analysis YAML.
+"""
 
+import argparse
 import pickle
 import os
 import sys
@@ -13,7 +18,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.classes.repr_analysis import RepresentationalAnalysis
-#from src.classes.beh_analysis import BehavioralAnalysis
 from src.datasets.uniform_dataset import create_dataloaders_uniform
 
 
@@ -69,17 +73,26 @@ def _build_feature_cache(val_loader):
     return features
 
 
-def run_analysis_pipeline():
+def _parse_args():
+    ap = argparse.ArgumentParser("Analyze trained models from YAML config")
+    ap.add_argument("--config", type=Path, default=Path("src/configs/analysis_config.yaml"))
+    return ap.parse_args()
+
+
+def run_analysis_pipeline(config_path: Path | None = None):
     """
     Script principale per l'analisi dei modelli addestrati.
     Carica i modelli in base al file di configurazione e lancia le analisi.
     """
     
     # === 1. Caricamento della configurazione ===
-    config_path = Path("src/configs/analysis_config.yaml")
-    if not config_path.exists():
+    if config_path is None:
+        args = _parse_args()
+        config_path = args.config
+
+    if not Path(config_path).exists():
         raise FileNotFoundError(f"Config file not found at {config_path}")
-        
+
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
