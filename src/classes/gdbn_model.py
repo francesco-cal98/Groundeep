@@ -152,6 +152,50 @@ class RBM(nn.Module):
         clip_w: Optional[float] = None,
         clip_b: Optional[float] = None,
     ):
+        # If requested, use the legacy unimodal CD-k update exactly as specified.
+        if getattr(self, "_use_legacy_unimodal", False) and not getattr(self, "softmax_groups", []):
+            lr = self.lr / (1 + 0.01 * epoch) if self.dynamic_lr else self.lr
+            mom = self.momentum if epoch <= 5 else self.final_momentum
+            B = data.size(0)
+            with torch.no_grad():
+                # Positive phase
+                pos_hid_probs = self.forward(data)
+                pos_hid_states = (pos_hid_probs > torch.rand_like(pos_hid_probs)).float()
+                pos_assoc = data.T @ pos_hid_probs
+
+                # Negative phase (CD-k)
+                neg_data = data
+                for _ in range(int(CD)):
+                    neg_vis_probs = self.backward(pos_hid_states)
+                    neg_data = (neg_vis_probs > torch.rand_like(neg_vis_probs)).float()
+                    neg_hid_probs = self.forward(neg_data)
+                    pos_hid_states = (neg_hid_probs > torch.rand_like(neg_hid_probs)).float()
+                neg_assoc = neg_data.T @ neg_hid_probs
+
+                # Update weights
+                self.W_m.mul_(mom).add_(
+                    lr * ((pos_assoc - neg_assoc) / B - self.weight_decay * self.W)
+                )
+                self.W.add_(self.W_m)
+
+                # Update hidden biases
+                self.hb_m.mul_(mom).add_(lr * (pos_hid_probs.sum(0) - neg_hid_probs.sum(0)) / B)
+                if self.sparsity:
+                    Q = pos_hid_probs.sum(0) / B
+                    avg_Q = Q.mean()
+                    if avg_Q > self.sparsity_factor:
+                        self.hb_m.add_(-lr * (Q - self.sparsity_factor))
+                self.hid_bias.add_(self.hb_m)
+
+                # Update visible biases
+                self.vb_m.mul_(mom).add_(lr * (data.sum(0) - neg_data.sum(0)) / B)
+                self.vis_bias.add_(self.vb_m)
+
+                # Reconstruction error
+                batch_loss = torch.sum((data - neg_vis_probs) ** 2) / B
+            return batch_loss
+
+        # Default: enhanced CD/PCD update used for joint/multimodal or non-legacy usage
         lr = self.lr / (1 + 0.01 * epoch) if self.dynamic_lr else self.lr
         mom = self.momentum if epoch <= 5 else self.final_momentum
         B = data.size(0)
@@ -166,7 +210,6 @@ class RBM(nn.Module):
             if self._pcd_v.size(0) >= B:
                 v = self._pcd_v[:B].clone()
             else:
-                # expand with fresh random rows to match current batch size
                 extra = torch.rand(B - self._pcd_v.size(0), V, device=data.device)
                 v = torch.cat([self._pcd_v, extra], dim=0).clone()
         else:
@@ -176,7 +219,6 @@ class RBM(nn.Module):
             h = (h_prob > torch.rand_like(h_prob)).float()
             v_prob = self.visible_probs(h)
             v = self.sample_visible(v_prob)
-        # persist/update chains buffer
         if use_pcd:
             if self._pcd_v is None or self._pcd_v.size(1) != V:
                 self._pcd_v = v.detach()
@@ -201,18 +243,14 @@ class RBM(nn.Module):
             wd_y = float(getattr(self, "wd_y", self.weight_decay * 2.0))
 
             dW = torch.empty_like(self.W)
-            # z block
             dW[:Dz, :] = lr_z * (W_posneg[:Dz, :] - self.weight_decay * self.W[:Dz, :])
-            # y block (slower LR, stronger WD)
             dW[Dz:Dz+K, :] = lr_y * (W_posneg[Dz:Dz+K, :] - wd_y * self.W[Dz:Dz+K, :])
-            # optional clipping
             if clip_w is not None:
                 dW.clamp_(-float(clip_w), float(clip_w))
 
             self.W_m.mul_(mom).add_(dW)
             self.W.add_(self.W_m)
 
-            # biases: hidden as usual
             upd_hb = lr * dhb
             if clip_b is not None:
                 upd_hb = upd_hb.clamp(-float(clip_b), float(clip_b))
@@ -222,7 +260,6 @@ class RBM(nn.Module):
                 self.hb_m.add_(-lr * (Q - self.sparsity_factor))
             self.hid_bias.add_(self.hb_m)
 
-            # visible bias split
             vb_update = torch.empty_like(self.vis_bias)
             vb_update[:Dz] = lr * (dvb[:Dz] - self.weight_decay * self.vis_bias[:Dz])
             vb_update[Dz:Dz+K] = lr_y * (dvb[Dz:Dz+K] - wd_y * self.vis_bias[Dz:Dz+K])
@@ -231,7 +268,6 @@ class RBM(nn.Module):
             self.vb_m.mul_(mom).add_(vb_update)
             self.vis_bias.add_(self.vb_m)
         else:
-            # generic RBM update
             dW = W_posneg - self.weight_decay * self.W
             if clip_w is not None:
                 dW = dW.clamp(-float(clip_w), float(clip_w))
@@ -512,6 +548,8 @@ class iDBN:
                 sparsity=(self.sparsity_last and i == len(layer_sizes) - 2),
                 sparsity_factor=self.sparsity_factor,
             ).to(self.device)
+            # Force legacy unimodal CD-k update for plain iDBN training
+            rbm._use_legacy_unimodal = True
             self.layers.append(rbm)
 
     # quali layer monitorare (come nei tuoi log)

@@ -17,7 +17,108 @@ import pandas as pd
 import sys
 from glob import glob
 from statsmodels.stats.multitest import multipletests
+# >>> ADD START: extra imports (safe)
+from typing import Optional, Tuple, Dict, Any
+from itertools import product
+from sklearn.linear_model import LinearRegression, LogisticRegression
+from sklearn.metrics import silhouette_score, davies_bouldin_score
+from scipy.linalg import orthogonal_procrustes
+# >>> ADD END
 
+def _center_gram(K):
+    n = K.shape[0]
+    H = np.eye(n) - np.ones((n, n))/n
+    return H @ K @ H
+
+def linear_cka(X, Y):
+    Xc = X - X.mean(0, keepdims=True)
+    Yc = Y - Y.mean(0, keepdims=True)
+    Kx = Xc @ Xc.T
+    Ky = Yc @ Yc.T
+    Kx_c = _center_gram(Kx)
+    Ky_c = _center_gram(Ky)
+    hsic = np.sum(Kx_c * Ky_c)
+    denom = np.sqrt(np.sum(Kx_c * Kx_c) * np.sum(Ky_c * Ky_c)) + 1e-12
+    return float(hsic / denom)
+
+def principal_angles(A, B, k=None):
+    A = A - A.mean(0, keepdims=True)
+    B = B - B.mean(0, keepdims=True)
+    pa = PCA(n_components=min(A.shape[1], 50)).fit(A).components_.T
+    pb = PCA(n_components=min(B.shape[1], 50)).fit(B).components_.T
+    if k is None:
+        k = min(pa.shape[1], pb.shape[1])
+    M = pa[:, :k].T @ pb[:, :k]
+    s = np.linalg.svd(M, compute_uv=False)
+    s = np.clip(s, -1.0, 1.0)
+    return np.arccos(s)  # radians
+
+def procrustes_similarity(X, Y):
+    Xc = X - X.mean(0, keepdims=True)
+    Yc = Y - Y.mean(0, keepdims=True)
+    R, _ = orthogonal_procrustes(Xc, Yc)
+    Y_hat = Yc @ R
+    num = np.sum(Xc * Y_hat)
+    den = np.sqrt(np.sum(Xc**2) * np.sum(Y_hat**2)) + 1e-12
+    return float(num / den)
+
+def linear_probe(X, y, task="regression"):
+    Xc = X - X.mean(0, keepdims=True)
+    if task == "regression":
+        m = LinearRegression()
+        m.fit(Xc, y)
+        r, _ = spearmanr(m.predict(Xc), y)
+        return {"spearman_r": float(r)}
+    else:
+        clf = LogisticRegression(max_iter=200, n_jobs=-1, multi_class="auto")
+        clf.fit(Xc, y)
+        return {"acc": float((clf.predict(Xc) == y).mean())}
+
+def cluster_quality(X, labels):
+    Xc = X - X.mean(0, keepdims=True)
+    if len(np.unique(labels)) < 2:
+        return {"silhouette": np.nan, "davies_bouldin": np.nan}
+    sil = silhouette_score(Xc, labels, metric="euclidean")
+    dbi = davies_bouldin_score(Xc, labels)
+    return {"silhouette": float(sil), "davies_bouldin": float(dbi)}
+
+def distance_vs_deltaN(class_means, class_labels, metric="euclidean"):
+    D = pairwise_distances(class_means, metric=metric)
+    L = np.array(class_labels)
+    xs, ys = [], []
+    for i in range(len(L)):
+        for j in range(i+1, len(L)):
+            xs.append(abs(int(L[i]) - int(L[j])))
+            ys.append(D[i, j])
+    rho, p = spearmanr(xs, ys)
+    return {"spearman_r": float(rho), "p": float(p), "pairs": len(xs)}
+
+def partial_rsa(brain_rdm, feature_rdm, confounds_rdms):
+    X = np.vstack(confounds_rdms).T if (confounds_rdms and len(confounds_rdms) > 0) else None
+    def resid(y, X):
+        if X is None: return y
+        X_aug = np.column_stack([np.ones(len(X)), X])
+        beta, *_ = np.linalg.lstsq(X_aug, y, rcond=None)
+        return y - X_aug @ beta
+    rb = resid(brain_rdm, X)
+    rf = resid(feature_rdm, X)
+    r, p = spearmanr(rb, rf)
+    return {"partial_spearman": float(r), "p": float(p)}
+
+def _robust_decode(embedding_analyzer, z_vec):
+    try:
+        if hasattr(embedding_analyzer, "decode_from_z"):
+            return embedding_analyzer.decode_from_z(z_vec)
+        if hasattr(embedding_analyzer, "model"):
+            mdl = embedding_analyzer.model
+            if hasattr(mdl, "decode"): 
+                return mdl.decode(z_vec)
+            if hasattr(mdl, "reconstruct_from_hidden"):
+                return mdl.reconstruct_from_hidden(z_vec)
+    except Exception as e:
+        print(f"[decode_from_z] error: {e}")
+    return None
+# >>> ADD END
 
 # === PATH SETUP ===
 current_dir = os.getcwd()
@@ -409,6 +510,157 @@ class VisualizerWithLogging:
         return correlations
 
 
+        # >>> ADD START: new methods (non-invasive)
+
+    def latent_traversal_grid(self, embedding_analyzer, Z, outdir, pcs=(0,1),
+                              steps=7, std_range=2.5, title_prefix=""):
+        os.makedirs(outdir, exist_ok=True)
+        Z = np.asarray(Z, dtype=np.float64)
+        if Z.ndim != 2 or Z.shape[0] < 2 or Z.shape[1] < 2:
+            print("latent_traversal_grid: invalid Z"); return None
+        pca = PCA(n_components=min(32, Z.shape[1]), random_state=42).fit(Z - Z.mean(0, keepdims=True))
+        comps = pca.components_
+        if max(pcs) >= comps.shape[0]:
+            print("latent_traversal_grid: pcs out of range"); return None
+        Z_mean = Z.mean(axis=0, keepdims=True)
+        grid_vals = np.linspace(-std_range, std_range, steps)
+        imgs = []
+        for a, b in product(grid_vals, grid_vals):
+            scores = np.zeros(comps.shape[0]); scores[pcs[0]] = a; scores[pcs[1]] = b
+            z = Z_mean + scores[:comps.shape[0]].reshape(1, -1) @ comps
+            z = z.squeeze(0)
+            imgs.append(_robust_decode(embedding_analyzer, z))
+        fig, axes = plt.subplots(steps, steps, figsize=(steps*2, steps*2))
+        k = 0
+        for i in range(steps):
+            for j in range(steps):
+                ax = axes[i,j]; im = imgs[k]; k += 1
+                if isinstance(im, np.ndarray):
+                    arr = np.squeeze(im)
+                    ax.imshow(arr if arr.ndim==3 else arr, cmap=None if arr.ndim==3 else "gray")
+                else:
+                    ax.axis("off")
+                ax.axis("off")
+        fig.suptitle(f"{title_prefix} Latent traversal (PCA) PCs {pcs}")
+        plt.tight_layout()
+        fpath = os.path.join(outdir, f"latent_grid_PCs{pcs[0]}_{pcs[1]}.png")
+        fig.savefig(fpath, dpi=200); plt.close(fig)
+        if self.wandb_run is not None:
+            try:
+                self.wandb_run.log({f"latent/grid/PC{pcs[0]}_PC{pcs[1]}": wandb.Image(fpath)})
+            except Exception as e:
+                print("W&B log (grid) failed:", e)
+        return fpath
+
+    def latent_traversal_1d(self, embedding_analyzer, Z, outdir, fixed_pc=0, traverse_pc=1,
+                            steps=11, std_range=3.0, title_prefix=""):
+        os.makedirs(outdir, exist_ok=True)
+        Z = np.asarray(Z, dtype=np.float64)
+        if Z.ndim != 2 or Z.shape[0] < 2 or Z.shape[1] < 2:
+            print("latent_traversal_1d: invalid Z"); return None
+        pca = PCA(n_components=min(32, Z.shape[1]), random_state=42).fit(Z - Z.mean(0, keepdims=True))
+        comps = pca.components_
+        if max(fixed_pc, traverse_pc) >= comps.shape[0]:
+            print("latent_traversal_1d: pc out of range"); return None
+        Z_mean = Z.mean(axis=0, keepdims=True)
+        vals = np.linspace(-std_range, std_range, steps)
+        imgs = []
+        for t in vals:
+            scores = np.zeros(comps.shape[0]); scores[fixed_pc] = 0.0; scores[traverse_pc] = t
+            z = Z_mean + scores[:comps.shape[0]].reshape(1, -1) @ comps
+            z = z.squeeze(0)
+            imgs.append(_robust_decode(embedding_analyzer, z))
+        fig, axes = plt.subplots(1, steps, figsize=(steps*2, 2))
+        if steps == 1: axes = [axes]
+        for i, ax in enumerate(axes):
+            im = imgs[i]
+            if isinstance(im, np.ndarray):
+                arr = np.squeeze(im)
+                ax.imshow(arr if arr.ndim==3 else arr, cmap=None if arr.ndim==3 else "gray")
+            else:
+                ax.axis("off")
+            ax.axis("off"); ax.set_title(f"{vals[i]:.1f}", fontsize=8)
+        fig.suptitle(f"{title_prefix} 1D: fix PC{fixed_pc}, move PC{traverse_pc}")
+        plt.tight_layout()
+        fpath = os.path.join(outdir, f"latent_traversal_PC{traverse_pc}_fixPC{fixed_pc}.png")
+        fig.savefig(fpath, dpi=200); plt.close(fig)
+        if self.wandb_run is not None:
+            try:
+                self.wandb_run.log({f"latent/strip/PC{traverse_pc}_fixPC{fixed_pc}": wandb.Image(fpath)})
+            except Exception as e:
+                print("W&B log (strip) failed:", e)
+        return fpath
+
+    def compare_embeddings(self, X, Y, log_prefix="compare"):
+        out = {}
+        try: out["cka"] = linear_cka(X, Y)
+        except Exception as e: out["cka"] = np.nan; print("CKA error:", e)
+        try:
+            ang = principal_angles(X, Y, k=10)
+            out["angle_mean"] = float(np.mean(ang)); out["angle_max"] = float(np.max(ang))
+        except Exception as e:
+            out["angle_mean"] = np.nan; out["angle_max"] = np.nan; print("Angles error:", e)
+        try: out["procrustes"] = procrustes_similarity(X, Y)
+        except Exception as e: out["procrustes"] = np.nan; print("Procrustes error:", e)
+        if self.wandb_run is not None:
+            self.wandb_run.log({f"{log_prefix}/cka": out["cka"],
+                                f"{log_prefix}/angle_mean": out["angle_mean"],
+                                f"{log_prefix}/angle_max": out["angle_max"],
+                                f"{log_prefix}/procrustes": out["procrustes"]})
+        return out
+
+    def probes_and_clusters(self, X, features, log_prefix):
+        res = {}
+        try:
+            if "N_list" in features and len(np.unique(features["N_list"])) > 1:
+                res["probe_num_acc"] = linear_probe(X, features["N_list"].astype(int), task="classification")["acc"]
+                qc = cluster_quality(X, features["N_list"])
+                res.update({f"silhouette": qc["silhouette"], f"davies_bouldin": qc["davies_bouldin"]})
+        except Exception as e:
+            print("probe/cluster error:", e)
+        try:
+            if "cumArea" in features: res["probe_cum_spearman"] = linear_probe(X, features["cumArea"], task="regression")["spearman_r"]
+            if "CH" in features:      res["probe_ch_spearman"]  = linear_probe(X, features["CH"], task="regression")["spearman_r"]
+        except Exception as e:
+            print("regression probe error:", e)
+        if self.wandb_run is not None:
+            tolog = {f"{log_prefix}/probe_num_acc": res.get("probe_num_acc", np.nan),
+                     f"{log_prefix}/silhouette": res.get("silhouette", np.nan),
+                     f"{log_prefix}/davies_bouldin": res.get("davies_bouldin", np.nan),
+                     f"{log_prefix}/probe_cumArea_spearman": res.get("probe_cum_spearman", np.nan),
+                     f"{log_prefix}/probe_CH_spearman": res.get("probe_ch_spearman", np.nan)}
+            self.wandb_run.log(tolog)
+        return res
+
+    def monotonicity_by_classes(self, X, labels, log_prefix, metric="euclidean"):
+        ul = np.unique(labels)
+        class_means = np.vstack([X[labels==u].mean(axis=0) for u in ul])
+        mon = distance_vs_deltaN(class_means, ul, metric=metric)
+        if self.wandb_run is not None:
+            self.wandb_run.log({f"{log_prefix}/spearman_r": mon["spearman_r"],
+                                f"{log_prefix}/p": mon["p"]})
+        return mon
+
+    def partial_rsa_numerosity(self, brain_rdm, labels, confounds_dict, log_prefix):
+        try:
+            num_rdm = pdist(labels.reshape(-1,1), metric="euclidean")
+            conf_rdms = []
+            for k in ["cumArea", "FA", "CH"]:
+                v = confounds_dict.get(k, None)
+                if v is not None and len(v) > 1:
+                    conf_rdms.append(pdist(v.reshape(-1,1), metric="euclidean"))
+            prs = partial_rsa(brain_rdm, num_rdm, conf_rdms)
+            if self.wandb_run is not None:
+                self.wandb_run.log({f"{log_prefix}/partial_spearman": prs["partial_spearman"],
+                                    f"{log_prefix}/p": prs["p"]})
+            return prs
+        except Exception as e:
+            print("partial RSA error:", e)
+            return {"partial_spearman": np.nan, "p": np.nan}
+
+    # >>> ADD END
+
+
 
 # /home/student/Desktop/Groundeep/src/analyses/main_analysis.py
 
@@ -477,14 +729,73 @@ for dist_name, cfg in configs.items():
         embeddings = np.array(output_dict.get(f'Z_{dist_name}', []), dtype=np.float64)
         
         # normalization of embeddings
-        embeddings_mean = np.mean(embeddings, axis=0)
-        embeddings_std = np.std(embeddings, axis=0)
-        embeddings = (embeddings - embeddings_mean) / (embeddings_std + 1e-10)  # Adding a small constant to avoid division by zero
+        #embeddings_mean = np.mean(embeddings, axis=0)
+        #embeddings_std = np.std(embeddings, axis=0)
+        #embeddings = (embeddings - embeddings_mean) / (embeddings_std + 1e-10)  # Adding a small constant to avoid division by zero
+        
+        
+        
         features = {
             "N_list": np.array(output_dict.get(f'labels_{dist_name}', [])),
             "cumArea": np.array(output_dict.get(f'cumArea_{dist_name}', [])),
             "CH": np.array(output_dict.get(f'CH_{dist_name}', []))
         }
+
+        visualizer.probes_and_clusters(
+            embeddings, 
+            features, 
+            log_prefix=f"probe_cluster/{dist_name}/{arch_name}"
+        )
+
+        # 2) Monotonicità distanza vs Δnumerosità (su class means)
+        visualizer.monotonicity_by_classes(
+            embeddings, 
+            features["N_list"], 
+            log_prefix=f"monotonicity/{dist_name}/{arch_name}",
+            metric="euclidean"
+        )
+
+        # 3) Latent traversals (grid PC1-PC2 + 1D)
+        lt_outdir = os.path.join(dist_output_dir, f"{arch_name}_latent")
+        visualizer.latent_traversal_grid(
+            embedding_analyzer=embedding_analyzer,
+            Z=embeddings,
+            outdir=lt_outdir,
+            pcs=(0,1),
+            steps=7,
+            std_range=2.5,
+            title_prefix=f"{arch_name} ({dist_name})"
+        )
+        visualizer.latent_traversal_1d(
+            embedding_analyzer=embedding_analyzer,
+            Z=embeddings,
+            outdir=lt_outdir,
+            fixed_pc=0,
+            traverse_pc=1,
+            steps=11,
+            std_range=3.0,
+            title_prefix=f"{arch_name} ({dist_name})"
+        )
+
+        # 4) Partial RSA (controllando confound) — usa lo stesso brain_rdm che calcoli in rsa_analysis
+        #    Se vuoi richiamarla qui, ricostruisci brain_rdm rapidamente:
+        try:
+            normed = embeddings / (np.linalg.norm(embeddings, axis=1, keepdims=True) + 1e-12)
+            brain_rdm_tmp = pdist(np.nan_to_num(normed), metric="cosine")
+            confounds_here = {
+                "cumArea": features.get("cumArea", None),
+                "FA": output_dict.get(f"FA_{dist_name}", None),
+                "CH": features.get("CH", None)
+            }
+            visualizer.partial_rsa_numerosity(
+                brain_rdm_tmp, 
+                features["N_list"], 
+                confounds_here, 
+                log_prefix=f"rsa_partial/{dist_name}/{arch_name}"
+            )
+        except Exception as e:
+            print("inline partial RSA error:", e)
+
 
         # === Call Visualizer methods ===
         # Ora passiamo embedding_analyzer ai metodi specifici che ne hanno bisogno

@@ -10,3 +10,4 @@ scipy
 statsmodels
 scikit-learn
 pytorch-lightning
+hydra-core

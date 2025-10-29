@@ -12,15 +12,16 @@ sparsity_factor: 0.05
 epochs: 200
 
 # Parametri del dataset e dei percorsi
-dataset_path: "/home/student/Desktop/Groundeep/stimuli_dataset_adaptive_auto"
+dataset_path: "/home/student/Desktop/Groundeep/stimuli_dataset_10_10"
 dataset_name: "stimuli_dataset.npz"
+dataset_distribution: "zipfian"  # "uniform" or "zipfian"
 batch_size: 128
 num_workers: 1
 multimodal_flag: false
 
 # Parametri per il salvataggio
-save_path: "/home/student/Desktop/Groundeep/networks/uniform/idbn_new_dataset_200_epochs"
-save_name: "dbn_trained_uniform"
+save_path: "/home/student/Desktop/Groundeep/networks/zipfian/idbn_new_dataset_200_epochs"
+save_name: "dbn_trained_zipfian"
 
 # Architetture del modello (lista di architetture da testare)
 layer_sizes_list:

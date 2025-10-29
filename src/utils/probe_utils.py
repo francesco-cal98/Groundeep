@@ -224,6 +224,7 @@ def train_linear_classifier(
 
     best_loss = float("inf")
     best_state = None
+    no_improve = 0
 
     model.train()
     for _ in range(max_steps):
@@ -450,6 +451,7 @@ def log_joint_linear_probe(
     if E.numel() == 0:
         return
     E_np = E.numpy()
+    wandb_run = getattr(model, 'wandb_run', None)
 
     probe_targets = ["cum_area", "convex_hull", "labels"]
     if "density" in feats:
@@ -484,7 +486,6 @@ def log_joint_linear_probe(
 
         df = _confusion_df(y_true, y_pred, n_classes, bin_names)
 
-        wandb_run = getattr(model, 'wandb_run', None)
         _log_accuracy_wandb(wandb_run, metric_name, acc, epoch)
         _log_confusion_table_wandb(wandb_run, df, metric_name, epoch)
         _log_bin_edges_wandb(wandb_run, metric_name, edges, epoch)

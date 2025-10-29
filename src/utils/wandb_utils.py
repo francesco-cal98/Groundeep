@@ -1,5 +1,8 @@
 import math
-import wandb
+try:
+    import wandb
+except Exception:
+    wandb = None
 import os
 import torchvision.utils as vutils
 import matplotlib.pyplot as plt 
@@ -18,7 +21,8 @@ def log_reconstructions_to_wandb(original, reconstruction, step=0, num_images=8,
     combined = torch.cat([val for pair in zip(orig, recon) for val in pair], dim=0)
 
     grid = vutils.make_grid(combined.unsqueeze(1), nrow=2, normalize=True)
-    wandb.log({name: [wandb.Image(grid, caption=name)]})
+    if wandb is not None:
+        wandb.log({name: [wandb.Image(grid, caption=name)]})
 
 def log_barplot(results, metric_name, arch_name, dist_name, ylabel="Value"):
     """
@@ -36,7 +40,8 @@ def log_barplot(results, metric_name, arch_name, dist_name, ylabel="Value"):
     plt.tight_layout()
 
     # log to wandb
-    wandb.log({f"{arch_name}_{dist_name}_{metric_name}_bins_plot": wandb.Image(plt)})
+    if wandb is not None:
+        wandb.log({f"{arch_name}_{dist_name}_{metric_name}_bins_plot": wandb.Image(plt)})
     plt.close()
 
 
@@ -105,7 +110,8 @@ def plot_2d_embedding_and_correlations(emb_2d, features, arch_name, dist_name, m
     plt.suptitle(f"{method_name} 2D Embedding for {arch_name} ({dist_name})", fontsize=16)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
-    wandb_run.log({f"embeddings/{dist_name}/{arch_name}/{method_name}_2d_embedding": wandb.Image(plt.gcf())})
+    if wandb_run is not None and wandb is not None:
+        wandb_run.log({f"embeddings/{dist_name}/{arch_name}/{method_name}_2d_embedding": wandb.Image(plt.gcf())})
     plt.close()
     return correlations
 
@@ -167,6 +173,7 @@ def plot_3d_embedding_and_correlations(emb_3d, features, arch_name, dist_name, m
     plt.suptitle(f"{method_name} 3D Embedding for {arch_name} ({dist_name})", fontsize=16)
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
-    wandb_run.log({f"embeddings/{dist_name}/{arch_name}/{method_name}_3d_embedding": wandb.Image(fig)})
+    if wandb_run is not None and wandb is not None:
+        wandb_run.log({f"embeddings/{dist_name}/{arch_name}/{method_name}_3d_embedding": wandb.Image(fig)})
     plt.close(fig)
     return correlations

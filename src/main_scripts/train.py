@@ -20,8 +20,8 @@ if project_root not in sys.path:
 if current_dir not in sys.path:
     sys.path.append(current_dir)
 
-from src.classes.gdbn_model import gDBN, iDBN
-from src.datasets.uniform_dataset import create_dataloaders_uniform
+from src.classes.gdbn_model import  iDBN
+from src.datasets.uniform_dataset import create_dataloaders_uniform,create_dataloaders_zipfian
 
 
 def _parse_args():
@@ -70,6 +70,8 @@ def run_training(config_path: Path | None = None):
         num_workers=config['num_workers'],
         multimodal_flag=config['multimodal_flag']
     )
+
+    
 
     wandb_run = wandb.init(project="groundeep-diagnostics")
 

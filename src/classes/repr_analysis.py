@@ -31,11 +31,27 @@ class RepresentationalAnalysis:
     Incapsula la logica per RSA, RDM e altri plot.
     """
 
-    def __init__(self, model, output_dir="results/analysis"):
+    def __init__(self, model, output_dir="results/analysis", embedding_cfg: dict | None = None):
         self.model = model
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
-        self.embedding_analyzer = Embedding_analysis(self.model)
+        # Optional embedding analysis (requires additional args)
+        self.embedding_analyzer = None
+        if isinstance(embedding_cfg, dict):
+            try:
+                p2d = embedding_cfg.get("path2data")
+                dname = embedding_cfg.get("data_name")
+                m_uniform = embedding_cfg.get("model_uniform")
+                m_zipf = embedding_cfg.get("model_zipfian")
+                arch = embedding_cfg.get("arch_name", "unknown_arch")
+                vsize = embedding_cfg.get("val_size", 0.05)
+                if all([p2d, dname, m_uniform, m_zipf]):
+                    self.embedding_analyzer = Embedding_analysis(
+                        p2d, dname, m_uniform, m_zipf, arch, vsize
+                    )
+            except Exception as e:
+                # Leave analyzer as None if not enough info or construction fails
+                print(f"[RepresentationalAnalysis] Embedding_analysis not initialized: {e}")
 
     def _compute_brain_rdm(self, embeddings, metric="cosine"):
         """Calcola la Matrice di Dissomiglianza (RDM) per gli embedding."""
@@ -193,11 +209,16 @@ class RepresentationalAnalysis:
         )
         
         # Esempio di utilizzo della classe Embedding_analysis
-        output_dict = self.embedding_analyzer._get_encodings()
-        print(f"Fetched encodings for analysis: {output_dict.keys()}")
-
-        # Esegui la selettività neuronale
-        spearman_rho, pval_corrected, significant = self.embedding_analyzer.compute_classwise_selectivity_with_fdr(source=dist_name)
+        if self.embedding_analyzer is not None:
+            output_dict = self.embedding_analyzer._get_encodings()
+            print(f"Fetched encodings for analysis: {output_dict.keys()}")
+            # Esegui la selettività neuronale
+            try:
+                self.embedding_analyzer.compute_classwise_selectivity_with_fdr(source=dist_name)
+            except Exception as e:
+                print(f"[RepresentationalAnalysis] Selectivity analysis skipped: {e}")
+        else:
+            print("[RepresentationalAnalysis] Embedding_analysis unavailable; skipping embedding-based analyses.")
         print(f"Computed neuronal selectivity for {dist_name} distribution.")
 
         print(f"Analyses for {arch_name} complete. Results are in the {self.output_dir} directory.")

@@ -1,228 +1,201 @@
-import torch
-import pickle as pkl
-import os 
+import os
 import sys
 import gc
+from pathlib import Path
+import pickle as pkl
+from typing import Dict, Any, Tuple
 
-from scipy.stats import spearmanr
-from statsmodels.stats.multitest import fdrcorrection
-from torch.utils.data import Subset, DataLoader
-
-current_dir = os.getcwd()
-sys.path.append(current_dir)  # Add the project root to sys.path
-
-from src.datasets.uniform_dataset import create_dataloaders_uniform,create_dataloaders_zipfian
-from torch.utils.data import DataLoader
-from sklearn.metrics import pairwise_distances
-from itertools import product
-import matplotlib.pyplot as plt
-import seaborn as sns
-import numpy as np 
-from scipy.stats import spearmanr
-from statsmodels.stats.multitest import multipletests
-from sklearn.metrics.pairwise import cosine_similarity
-from scipy.spatial import distance
-from scipy.stats import spearmanr
-from statsmodels.stats.multitest import fdrcorrection
 import numpy as np
-import pandas as pd
+import torch
+from torch.utils.data import DataLoader, Subset
 
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
+from src.datasets.uniform_dataset import create_dataloaders_uniform, create_dataloaders_zipfian  # noqa
 
 
 class Embedding_analysis:
+    """
+    Estrae embeddings e feature in modo coerente per confronto per-stimolo:
+    - usa il dataloader 'uniform' come base inputs per entrambi i modelli (uniform & zipfian),
+      così Z_* e le feature/labels sono allineate 1:1.
+    - (opzionale) puoi aggiungere una seconda vista zipf-on-zipf se servono analisi per-classe non allineate.
+    """
 
-    def __init__(self,path2data,data_name,model_uniform,model_zipfian,arch_name,val_size = 0.005):
-        
+    def __init__(self, path2data: str, data_name: str,
+                 model_uniform: str, model_zipfian: str, arch_name: str, val_size: float = 0.05):
         self.path2data = path2data
         self.data_name = data_name
         self.arch_name = arch_name
 
-        _,self.val_dataloader_uniform,_ = create_dataloaders_uniform(self.path2data,self.data_name,batch_size = 128,val_size = val_size)
-        
-        _,self.val_dataloader_zipfian,_ = create_dataloaders_zipfian(self.path2data,self.data_name,batch_size = 128,val_size = val_size)
-        
-        # Override batch size for validation loader
+        # Dataloaders
+        self.train_dataloader_uniform, self.val_dataloader_uniform, self.test_dataloader_uniform = create_dataloaders_uniform(
+            self.path2data, self.data_name, batch_size=128, val_size=val_size
+        )
+        self.train_dataloader_zipfian, self.val_dataloader_zipfian, self.test_dataloader_zipfian = create_dataloaders_zipfian(
+            self.path2data, self.data_name, batch_size=128, val_size=val_size
+        )
+
+        # Unico batch (intero val) per semplicità/consistenza
         self.val_dataloader_uniform = DataLoader(
             self.val_dataloader_uniform.dataset, batch_size=len(self.val_dataloader_uniform.dataset), shuffle=False
         )
-
         self.val_dataloader_zipfian = DataLoader(
             self.val_dataloader_zipfian.dataset, batch_size=len(self.val_dataloader_zipfian.dataset), shuffle=False
         )
 
-        # Subset object (e.g., torch.utils.data.Subset) – needed to access selected indices
+        # Accesso a dataset e indici
         self.dataset_uniform_subset = self.val_dataloader_uniform.dataset
-
-        # The original dataset (e.g., UniformDataset) – needed to access the feature lists
         self.dataset_uniform = self.dataset_uniform_subset.dataset
-
 
         self.dataset_zipfian_subset = self.val_dataloader_zipfian.dataset
         self.dataset_zipfian = self.dataset_zipfian_subset.dataset
 
-        with open(model_uniform, 'rb') as f:
-            self.model_uniform = pkl.load(f)
+        # Carica modelli
+        self.model_uniform = self._load_model(model_uniform)
+        self.model_zipfian = self._load_model(model_zipfian)
 
-        with open(model_zipfian, 'rb') as f:
-            self.model_zipfian = pkl.load(f)
-    
-    def _get_encodings(self):
+        self.output_dict: Dict[str, Any] = {}
 
+    @staticmethod
+    def _load_model(path: str):
+        target_device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+        orig_restore = getattr(torch.serialization, "default_restore_location", None)
+        if orig_restore is not None:
+            torch.serialization.default_restore_location = (
+                lambda storage, loc: storage.cuda() if target_device.type == 'cuda' else storage.cpu()
+            )
+        try:
+            with open(path, 'rb') as f:
+                m = pkl.load(f)
+        finally:
+            if orig_restore is not None:
+                torch.serialization.default_restore_location = orig_restore
+        # accetta dict pickled {"layers": [...]} oppure oggetti
+        if isinstance(m, dict) and 'layers' in m:
+            class _Wrapper:
+                def __init__(self, d):
+                    self.layers = d.get('layers', [])
+                    self.params = d.get('params', {})
 
-        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+                def decode(self, top):
+                    with torch.no_grad():
+                        cur = top
+                        for rbm in reversed(self.layers):
+                            cur = rbm.backward(cur)
+                        return cur
+            return _Wrapper(m)
+        return m
+
+    def _get_encodings(self) -> Dict[str, Any]:
+        def _infer_device(model):
+            layers = getattr(model, "layers", [])
+            for layer in layers:
+                for attr in ("W", "hid_bias", "vis_bias", "hbias", "vbias"):
+                    tensor = getattr(layer, attr, None)
+                    if isinstance(tensor, torch.Tensor):
+                        return tensor.device
+            return torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+
+        device_uniform = _infer_device(self.model_uniform)
+        device_zipf = _infer_device(self.model_zipfian)
         self.output_dict = {}
 
-        # === Estrai batch uniforme (intero dataset) ===
+        # === Batch UNIFORM (base per-stimolo coerente) ===
         batch_uniform = next(iter(self.val_dataloader_uniform))
         inputs_uniform, self.labels_uniform = batch_uniform
-        self.inputs_uniform = inputs_uniform.to(device)
+        inputs_uniform = inputs_uniform.to(torch.float32)
+        self.inputs_uniform = inputs_uniform.detach().cpu()
 
+        # Forward top-hidden
         with torch.no_grad():
-            h1_probs_uniform = self.model_uniform.layers[0].forward(self.inputs_uniform)
-            h2_probs_uniform = self.model_uniform.layers[1].forward(h1_probs_uniform)
+            # Uniform model on uniform inputs
+            cur = inputs_uniform.to(device_uniform)
+            for rbm in self.model_uniform.layers:
+                cur = rbm.forward(cur)
+            Z_uniform = cur.detach().cpu().numpy()
 
-            h1_probs_zipfian = self.model_zipfian.layers[0].forward(self.inputs_uniform)
-            h2_probs_zipfian = self.model_zipfian.layers[1].forward(h1_probs_zipfian)
-
-        Z_uniform = h2_probs_uniform.cpu().numpy()
-        Z_zipfian = h2_probs_zipfian.cpu().numpy()
+            # Zipf model on the SAME uniform inputs
+            cur2 = inputs_uniform.to(device_zipf)
+            for rbm in self.model_zipfian.layers:
+                cur2 = rbm.forward(cur2)
+            Z_zipf_on_uniform = cur2.detach().cpu().numpy()
 
         self.inputs_uniform = inputs_uniform.detach().cpu()
+
+        # Feature/labels coerenti con inputs_uniform
+        indices_uniform = self.dataset_uniform_subset.indices
+        labels_uniform = self.labels_uniform.cpu().numpy()
+        cumArea_uniform = np.array([self.dataset_uniform.cumArea_list[i] for i in indices_uniform])
+        CH_uniform = np.array([self.dataset_uniform.CH_list[i] for i in indices_uniform])
+
+        # Salva (stesso set per entrambe le viste)
+        self.output_dict['Z_uniform'] = Z_uniform
+        self.output_dict['Z_zipfian'] = Z_zipf_on_uniform
+        self.output_dict['labels_uniform'] = labels_uniform
+        self.output_dict['labels_zipfian'] = labels_uniform
+
+        self.output_dict['cumArea_uniform'] = cumArea_uniform
+        self.output_dict['cumArea_zipfian'] = cumArea_uniform
+
+        self.output_dict['CH_uniform'] = CH_uniform
+        self.output_dict['CH_zipfian'] = CH_uniform
+
         gc.collect()
         torch.cuda.empty_cache()
 
-        # === Uniform features ===
-        indices_uniform = self.dataset_uniform_subset.indices
-        cumArea_vals_uniform = [self.dataset_uniform.cumArea_list[i] for i in indices_uniform]
-        convex_hull_uniform = [self.dataset_uniform.CH_list[i] for i in indices_uniform]
-        #items_vals_uniform = [self.dataset_uniform.Items_list[i] for i in indices_uniform]
-        #fa_uniform = [self.dataset_uniform.FA_list[i] for i in indices_uniform]
-        ch_uniform = [self.dataset_uniform.CH_list[i] for i in indices_uniform]
-
-        # === FILTRO: sopra la mediana di Items ===
-        #items_array = np.array(items_vals_uniform)
-        #mask = items_array > np.median(items_array)
-        #self.filtered_indices_uniform = np.array(indices_uniform)[mask]
-
-        #filtered_subset = Subset(self.dataset_uniform, self.filtered_indices_uniform)
-       # self.filtered_dataloader_uniform = DataLoader(filtered_subset, batch_size=len(filtered_subset), shuffle=False)
-
-
-        # Applica il filtro a tutte le variabili uniformi
-        self.output_dict['Z_uniform'] = Z_uniform
-        self.output_dict['Z_zipfian'] = Z_zipfian
-        self.output_dict['labels_uniform'] = self.labels_uniform.cpu().numpy()
-        self.output_dict['labels_zipfian'] = self.labels_uniform.cpu().numpy()
-        #self.output_dict['FA_uniform'] = np.array(fa_uniform)
-        self.output_dict['CH_uniform'] = np.array(ch_uniform)
-        self.output_dict['cumArea_uniform_raw'] = np.array(cumArea_vals_uniform)
-        #self.output_dict['Items_uniform_raw'] = items_array[mask]
-
-        # === Bin numerosity ===
-        numerosity_bins_uniform = pd.cut(
-            self.output_dict['labels_uniform'],
-            bins=[0, 4, 8, 12, 16, 20, 24, 28, 32],
-            labels=["1–4", "5–8", "9–12", "13–16", "17–20", "21–24", "25–28", "29–32"],
-        )
-        self.output_dict['numerosity_bin_uniform'] = numerosity_bins_uniform
-
-        # === Binned features dopo filtro ===
-        cumArea_quantiles_uniform, cumArea_bins_uniform = pd.qcut(
-            self.output_dict['cumArea_uniform_raw'], q=5, labels=False, retbins=True, duplicates='drop'
-        )
-        convex_hull_quantiles_uniform, convex_hull_bins_uniform = pd.qcut(
-            self.output_dict['CH_uniform'], q=5, labels=False, retbins=True, duplicates='drop'
-        )
-        #Items_quantiles_uniform, Items_bins_uniform = pd.qcut(
-        #    self.output_dict['Items_uniform_raw'], q=5, labels=False, retbins=True, duplicates='drop'
-        #)
-
-        self.output_dict['convex_hull_uniform'] = convex_hull_quantiles_uniform
-        self.output_dict['convex_hull_bins_uniform'] = convex_hull_bins_uniform
-        self.output_dict['cumArea_uniform'] = cumArea_quantiles_uniform
-        self.output_dict['cumArea_bins_uniform'] = cumArea_bins_uniform
-        #self.output_dict['Items_uniform'] = Items_quantiles_uniform
-        #self.output_dict['Items_bins_uniform'] = Items_bins_uniform
-
-        # === Zipfian features (filtrate con lo stesso mask di uniform) ===
-        indices_zipfian = self.dataset_zipfian_subset.indices
-
-        cumArea_vals_zipfian = [self.dataset_zipfian.cumArea_list[i] for i in indices_zipfian]
-        #fa_zipfian = [self.dataset_zipfian.FA_list[i] for i in indices_zipfian]
-        ch_zipfian = [self.dataset_zipfian.CH_list[i] for i in indices_zipfian]
-
-        # Applica lo stesso filtro basato su Items_uniform
-        filtered_indices_zipfian = np.array(indices_zipfian)
-
-        #self.output_dict['FA_zipfian'] = np.array(fa_zipfian)
-        self.output_dict['CH_zipfian'] = np.array(ch_zipfian)
-        self.output_dict['cumArea_zipfian_raw'] = np.array(cumArea_vals_zipfian)
-
-        # Binning delle feature Zipfian filtrate
-        cumArea_quantiles_zipfian, cumArea_bins_zipfian = pd.qcut(
-            self.output_dict['cumArea_zipfian_raw'], q=5, labels=False, retbins=True, duplicates='drop'
-        )
-
-        self.output_dict['cumArea_zipfian'] = cumArea_quantiles_zipfian
-        self.output_dict['cumArea_bins_zipfian'] = cumArea_bins_zipfian
-
+        # === (OPZIONALE) Zipf-on-zipf per analisi non allineate per-stimolo ===
+        # batch_zipf = next(iter(self.val_dataloader_zipfian))
+        # inputs_zipf, labels_zipf = batch_zipf
+        # with torch.no_grad():
+        #     cur = inputs_zipf.to(device)
+        #     for rbm in self.model_zipfian.layers:
+        #         cur = rbm.forward(cur)
+        #     Z_zipf_on_zipf = cur.detach().cpu().numpy()
+        # indices_zipf = self.dataset_zipfian_subset.indices
+        # cumArea_zipf = np.array([self.dataset_zipfian.cumArea_list[i] for i in indices_zipf])
+        # CH_zipf = np.array([self.dataset_zipfian.CH_list[i] for i in indices_zipf])
+        # self.output_dict['Z_zipf_on_zipf'] = Z_zipf_on_zipf
+        # self.output_dict['labels_zipf'] = labels_zipf.numpy()
+        # self.output_dict['cumArea_zipf'] = cumArea_zipf
+        # self.output_dict['CH_zipf'] = CH_zipf
 
         return self.output_dict
 
-
-
-    def reconstruct_input(self, input_type="uniform"):
+    def reconstruct_input(self, input_type: str = "uniform") -> Tuple[np.ndarray, np.ndarray]:
         """
-        Ricostruisce gli input a partire dai codici latenti del modello specificato.
-        input_type: 'uniform' o 'zipfian'
+        Ricostruisce gli input passando su/giù la pila RBM del modello scelto.
+        input_type: 'uniform' | 'zipfian'  (usa gli inputs_uniform come base per semplicità)
         """
-
-        if torch.cuda.is_available():
-            device = torch.device('cuda:0')
-        else:
-            device = torch.device('cpu')
-
+        device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         dataloader = self.val_dataloader_uniform
         model = self.model_uniform if input_type == "uniform" else self.model_zipfian
-
-
 
         batch = next(iter(dataloader))
         inputs, _ = batch
         inputs = inputs.to(device)
 
         with torch.no_grad():
-            temp_data = inputs
+            cur = inputs
             for rbm in model.layers:
-                temp_data = rbm.forward(temp_data)
+                cur = rbm.forward(cur)
             for rbm in reversed(model.layers):
-                temp_data = rbm.backward(temp_data)
-        
-        reconstruction = temp_data.cpu().numpy()
+                cur = rbm.backward(cur)
+            reconstruction = cur.cpu().numpy()
         original = inputs.cpu().numpy()
         return original, reconstruction
 
+    # ====== utilità addizionali già presenti nel tuo progetto (lasciate intatte) ======
 
     def get_classwise_distance_matrices(self, Z1, Z2, labels, metric='euclidean'):
-        """
-        Computes class-to-class average distance matrices for two embedding spaces (Z1 and Z2).
-        
-        Parameters:
-            Z1, Z2: Embeddings (n_samples x n_features)
-            labels: Class labels (n_samples,)
-            metric: 'euclidean' or 'mahalanobis'
-        
-        Returns:
-            A1, A2: Class-to-class average distance matrices (n_classes x n_classes)
-        """
-        
+        from itertools import product
+        from scipy.spatial import distance
         if metric == 'mahalanobis':
-            # Compute inverse covariance matrices
             VI1 = np.linalg.pinv(np.cov(Z1.T))
             VI2 = np.linalg.pinv(np.cov(Z2.T))
-            
-            # Compute pairwise Mahalanobis distance matrices manually
             n = Z1.shape[0]
             dist1 = np.zeros((n, n))
             dist2 = np.zeros((n, n))
@@ -231,11 +204,10 @@ class Embedding_analysis:
                     dist1[i, j] = distance.mahalanobis(Z1[i], Z1[j], VI1)
                     dist2[i, j] = distance.mahalanobis(Z2[i], Z2[j], VI2)
         else:
-            # Default to Euclidean
+            from sklearn.metrics import pairwise_distances
             dist1 = pairwise_distances(Z1, metric=metric, n_jobs=20)
             dist2 = pairwise_distances(Z2, metric=metric, n_jobs=20)
 
-        # Compute class-to-class average distances
         unique_labels = np.unique(labels)
         n_classes = len(unique_labels)
         A1 = np.empty((n_classes, n_classes))
@@ -258,22 +230,20 @@ class Embedding_analysis:
                 else:
                     A1[i_idx, j_idx] = np.nan
                     A2[i_idx, j_idx] = np.nan
-
         return A1, A2
 
-
-    def get_class_dist_matrix(self,Z_dist, Z_base, labels):
+    def get_class_dist_matrix(self, Z_dist, Z_base, labels):
+        from itertools import product
+        from sklearn.metrics import pairwise_distances
         dist1 = pairwise_distances(Z_dist, metric='euclidean', n_jobs=20)
         dist2 = pairwise_distances(Z_base, metric='euclidean', n_jobs=20)
         ro = np.divide(dist1, dist2)
         ro[np.isnan(ro)] = 1
-
-        ro = (ro - ro.mean())  # Optionally normalize further
+        ro = (ro - ro.mean())
 
         unique_labels = np.unique(labels)
         n = len(unique_labels)
         A = np.empty((n, n))
-
         for i_idx, i in enumerate(unique_labels):
             for j_idx, j in enumerate(unique_labels):
                 if i == j:
@@ -283,72 +253,39 @@ class Embedding_analysis:
                     idx_i = np.where(labels == i)[0]
                     idx_j = np.where(labels == j)[0]
                     sel = list(product(idx_i, idx_j))
-
-                l = [ro[u, v] for u, v in sel]
+                l = [ro[u, v] for u, v in sel] if sel else []
                 A[i_idx, j_idx] = np.median(l) if l else np.nan
-
         return A
-    
+
     def compute_classwise_selectivity_with_fdr(self, source='uniform', alpha=0.05, method='fdr_bh'):
-        """
-        Per ogni classe, calcola la correlazione di Spearman (ρ) tra ciascun neurone e una maschera binaria (one-vs-all),
-        poi applica una correzione FDR globale su tutti i test neurone-classe.
-
-        Args:
-            source (str): 'uniform' o 'zipfian'
-            alpha (float): livello di significatività per la FDR
-            method (str): metodo di correzione FDR (default: 'fdr_bh')
-
-        Returns:
-            spearman_rho_df: DataFrame [classi x neuroni] con i valori di ρ
-            pval_corrected_df: p-values corretti per FDR (stessa forma)
-            significant_df: boolean mask con True per i test significativi (stessa forma)
-        """
-
-
         if not hasattr(self, 'output_dict'):
             raise RuntimeError("Run _get_encodings() first.")
-
-        Z = self.output_dict[f'Z_{source}']          # shape: (n_samples, n_neurons)
+        Z = self.output_dict[f'Z_{source}']
         labels = self.output_dict[f'labels_{source}']
         num_neurons = Z.shape[1]
         classes = np.unique(labels)
+        from scipy.stats import spearmanr
+        from statsmodels.stats.multitest import multipletests
 
-        rhos = []
-        pvals = []
-
+        rhos, pvals = [], []
         for cls in classes:
             binary_labels = (labels == cls).astype(int)
-            class_rhos = []
-            class_pvals = []
+            class_rhos, class_pvals = [], []
             for i in range(num_neurons):
                 rho, p = spearmanr(Z[:, i], binary_labels)
-                class_rhos.append(rho)
-                class_pvals.append(p)
-            rhos.append(class_rhos)
-            pvals.append(class_pvals)
+                class_rhos.append(rho); class_pvals.append(p)
+            rhos.append(class_rhos); pvals.append(class_pvals)
 
-        spearman_rho_df = pd.DataFrame(rhos, index=classes)
-        pval_df = pd.DataFrame(pvals, index=classes)
-        spearman_rho_df.index.name = 'numerosity'
-        pval_df.index.name = 'numerosity'
+        spearman_rho_df = np.array(rhos)
+        pval_df = np.array(pvals)
 
-        # Flatten all p-values for FDR correction globale
-        pval_array = pval_df.values.flatten()
-        rejected, pvals_corrected, _, _ = multipletests(pval_array, alpha=alpha, method=method)
-
-        # Reshape back
-        pval_corrected_df = pd.DataFrame(
-            pvals_corrected.reshape(pval_df.shape),
-            index=pval_df.index,
-            columns=pval_df.columns
+        flat = pval_df.flatten()
+        rejected, pvals_corrected, _, _ = multipletests(flat, alpha=alpha, method=method)
+        pval_corrected = pvals_corrected.reshape(pval_df.shape)
+        significant = rejected.reshape(pval_df.shape)
+        import pandas as pd
+        return (
+            pd.DataFrame(spearman_rho_df, index=classes),
+            pd.DataFrame(pval_corrected, index=classes),
+            pd.DataFrame(significant, index=classes),
         )
-        significant_df = pd.DataFrame(
-            rejected.reshape(pval_df.shape),
-            index=pval_df.index,
-            columns=pval_df.columns
-        )
-
-        return spearman_rho_df, pval_corrected_df, significant_df
-
-
