@@ -21,9 +21,9 @@ def main():
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Paths
-    path_to_dbn_dir = "/home/student/Desktop/Groundeep/networks/uniform/dataset_cum_area_0"
-    path_to_train_dataset = "/home/student/Desktop/Groundeep/circle_dataset_100x100/binary_de_wind_train.pkl"
-    path_to_test_dataset = "/home/student/Desktop/Groundeep/circle_dataset_100x100/binary_de_wind_test.pkl"
+    path_to_dbn_dir = "/home/student/Desktop/Groundeep/networks/uniform/dataset_10_10"
+    path_to_train_dataset = "/home/student/Desktop/Groundeep/behavioral_datasets/binary_de_wind_train.pkl"
+    path_to_test_dataset = "/home/student/Desktop/Groundeep/behavioral_datasets/binary_de_wind_test.pkl"
     test_file = "/home/student/Desktop/Groundeep/NumStim_7to28_100x100_TE.mat"
     output_folder = "/home/student/Desktop/Groundeep/outputs/results_excel_new_dataset"
     output_file = "model_coefficients_results_all_uniform.xlsx"
@@ -31,12 +31,18 @@ def main():
 
     # Load datasets
     train_dataset = pickle.load(open(path_to_train_dataset, 'rb'))
-    XtrainComp, YtrainComp, idxs_train = torch.tensor(train_dataset['data']).to(DEVICE), torch.tensor(train_dataset['labels']).to(DEVICE), torch.tensor(train_dataset['idxs']).to(DEVICE)
-    XtrainComp = XtrainComp / 255 # normalization
+    XtrainComp = torch.tensor(train_dataset['data']).to(DEVICE)
+    if float(train_dataset['data'].max()) > 1.0 + 1e-6:
+        XtrainComp = XtrainComp / 255.0
+    YtrainComp = torch.tensor(train_dataset['labels']).to(DEVICE)
+    idxs_train = torch.tensor(train_dataset['idxs']).to(DEVICE)
 
     test_dataset = pickle.load(open(path_to_test_dataset, 'rb'))
-    XtestComp, YtestComp, idxs_test = torch.tensor(test_dataset['data']).to(DEVICE), torch.tensor(test_dataset['labels']).to(DEVICE), torch.tensor(test_dataset['idxs']).to(DEVICE)
-    XtestComp = XtestComp / 255 # normalization
+    XtestComp = torch.tensor(test_dataset['data']).to(DEVICE)
+    if float(test_dataset['data'].max()) > 1.0 + 1e-6:
+        XtestComp = XtestComp / 255.0
+    YtestComp = torch.tensor(test_dataset['labels']).to(DEVICE)
+    idxs_test = torch.tensor(test_dataset['idxs']).to(DEVICE)
 
     # Load test MAT data
     test_contents = io.loadmat(test_file)

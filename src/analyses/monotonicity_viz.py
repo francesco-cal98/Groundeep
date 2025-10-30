@@ -1,9 +1,10 @@
+import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from pathlib import Path
-from typing import Tuple, Dict
+from typing import Tuple, Dict, List
 
 from sklearn.metrics import pairwise_distances
 from sklearn.decomposition import PCA
@@ -31,31 +32,41 @@ def pairwise_centroid_distances(class_means: np.ndarray, metric: str = "euclidea
 
 
 def _pairs_deltaN_and_distances(D: np.ndarray, classes: np.ndarray):
-    xs, ys = [], []
+    xs, ys, ci, cj = [], [], [], []
     C = len(classes)
     for i in range(C):
         for j in range(i + 1, C):
             xs.append(abs(int(classes[i]) - int(classes[j])))
             ys.append(D[i, j])
-    return np.array(xs, dtype=float), np.array(ys, dtype=float)
+            ci.append(int(classes[i]))
+            cj.append(int(classes[j]))
+    return (
+        np.array(xs, dtype=float),
+        np.array(ys, dtype=float),
+        np.array(ci, dtype=int),
+        np.array(cj, dtype=int),
+    )
 
 
-def plot_distance_vs_deltaN(D: np.ndarray, classes: np.ndarray, out_path: Path) -> Dict[str, float]:
+def plot_distance_vs_deltaN(D: np.ndarray, classes: np.ndarray, out_path: Path) -> Dict[str, float | List[Dict[str, float]]]:
     if D.size == 0 or len(classes) < 2:
-        return {"spearman_r": np.nan, "p": np.nan, "pairs": 0}
+        return {"spearman_r": np.nan, "p": np.nan, "pairs": 0, "outliers": []}
 
-    x, y = _pairs_deltaN_and_distances(D, classes)
+    x, y, c_i, c_j = _pairs_deltaN_and_distances(D, classes)
 
     # Aggregate by ΔN with simple bootstrap CI (percentile)
     uniq = np.unique(x).astype(int)
     medians, lo, hi = [], [], []
     rng = np.random.default_rng(12345)
+    median_map = {}
     for d in uniq:
         vals = y[x == d]
         if len(vals) == 0:
             medians.append(np.nan); lo.append(np.nan); hi.append(np.nan)
             continue
-        medians.append(np.median(vals))
+        m = np.median(vals)
+        medians.append(m)
+        median_map[int(d)] = m
         # bootstrap
         if len(vals) > 1:
             boots = [np.median(rng.choice(vals, size=len(vals), replace=True)) for _ in range(200)]
@@ -81,13 +92,36 @@ def plot_distance_vs_deltaN(D: np.ndarray, classes: np.ndarray, out_path: Path) 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out_path, dpi=300)
     plt.close()
-    return {"spearman_r": float(rho), "p": float(p), "pairs": int(len(x))}
+
+    # Identify outliers (top residuals above median)
+    residuals = y - np.array([median_map[int(d)] for d in x])
+    outlier_idx = np.argsort(residuals)[::-1]
+    outliers: List[Dict[str, float]] = []
+    for idx in outlier_idx[: min(10, len(outlier_idx))]:
+        if residuals[idx] <= 0:
+            break
+        outliers.append(
+            {
+                "deltaN": float(x[idx]),
+                "distance": float(y[idx]),
+                "residual": float(residuals[idx]),
+                "class_i": float(c_i[idx]),
+                "class_j": float(c_j[idx]),
+            }
+        )
+
+    return {
+        "spearman_r": float(rho),
+        "p": float(p),
+        "pairs": int(len(x)),
+        "outliers": outliers,
+    }
 
 
 def plot_violin_by_deltaN(D: np.ndarray, classes: np.ndarray, out_path: Path):
     if D.size == 0 or len(classes) < 2:
         return
-    x, y = _pairs_deltaN_and_distances(D, classes)
+    x, y, _, _ = _pairs_deltaN_and_distances(D, classes)
     df = pd.DataFrame({"deltaN": x.astype(int), "distance": y})
     plt.figure(figsize=(8, 5))
     sns.violinplot(data=df, x="deltaN", y="distance", inner="box", cut=0)
@@ -157,7 +191,7 @@ def save_deltaN_stats_csv(D: np.ndarray, classes: np.ndarray, out_csv: Path):
     if D.size == 0:
         pd.DataFrame(columns=["deltaN", "median", "mean", "std", "q25", "q75", "n_pairs"]).to_csv(out_csv, index=False)
         return
-    x, y = _pairs_deltaN_and_distances(D, classes)
+    x, y, _, _ = _pairs_deltaN_and_distances(D, classes)
     uniq = np.unique(x).astype(int)
     rows = []
     for d in uniq:
@@ -177,3 +211,95 @@ def save_deltaN_stats_csv(D: np.ndarray, classes: np.ndarray, out_csv: Path):
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_csv, index=False)
 
+
+def plot_outlier_pairs(
+    dataset,
+    class_means: np.ndarray,
+    classes: np.ndarray,
+    outliers: List[Dict[str, float]],
+    out_path: Path,
+    max_examples: int = 5,
+    include_examples: bool = True,
+):
+    if not outliers or class_means.size == 0:
+        return
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    n_examples = min(max_examples, len(outliers))
+    pca = PCA(n_components=2, random_state=42).fit(class_means)
+    coords = pca.transform(class_means)
+    class_to_coord = {int(cls): coords[idx] for idx, cls in enumerate(classes)}
+
+    x_min, x_max = coords[:, 0].min(), coords[:, 0].max()
+    y_min, y_max = coords[:, 1].min(), coords[:, 1].max()
+    margin_x = (x_max - x_min) * 0.1 if x_max > x_min else 1.0
+    margin_y = (y_max - y_min) * 0.1 if y_max > y_min else 1.0
+
+    fig, axes = plt.subplots(1, n_examples, figsize=(4.6 * n_examples, 4.6), sharex=True, sharey=True)
+    if n_examples == 1:
+        axes = [axes]
+
+    data_np = None
+    labels_np = None
+    image_side = None
+    if include_examples and dataset is not None and hasattr(dataset, "data") and hasattr(dataset, "labels"):
+        data_tensor = dataset.data.detach().cpu()
+        data_np = data_tensor.numpy()
+        labels_np = np.asarray(dataset.labels).astype(int)
+        if data_np.shape[1] > 0:
+            image_side = int(math.sqrt(data_np.shape[1]))
+
+    rng = np.random.default_rng(1234)
+
+    for ax, out in zip(axes, outliers[:n_examples]):
+        ax.scatter(coords[:, 0], coords[:, 1], c="lightgray", s=25, label="centroids")
+        cls_i = int(out["class_i"])
+        cls_j = int(out["class_j"])
+        coord_i = class_to_coord.get(cls_i)
+        coord_j = class_to_coord.get(cls_j)
+        if coord_i is not None and coord_j is not None:
+            ax.scatter([coord_i[0]], [coord_i[1]], color="tab:blue", s=70, label="class i")
+            ax.scatter([coord_j[0]], [coord_j[1]], color="tab:red", s=70, label="class j")
+            ax.plot([coord_i[0], coord_j[0]], [coord_i[1], coord_j[1]], color="tab:purple", linewidth=2, alpha=0.8)
+            ax.text(coord_i[0], coord_i[1], f"{cls_i}", ha="center", va="center", color="white", fontsize=9)
+            ax.text(coord_j[0], coord_j[1], f"{cls_j}", ha="center", va="center", color="white", fontsize=9)
+        ax.set_title(
+            f"ΔN={int(out['deltaN'])}\nDist={out['distance']:.3f}\nΔ={out['residual']:.3f}",
+            fontsize=11,
+        )
+        ax.set_xlim(x_min - margin_x, x_max + margin_x)
+        ax.set_ylim(y_min - margin_y, y_max + margin_y)
+        ax.set_xticks([])
+        ax.set_yticks([])
+
+        if include_examples and data_np is not None and image_side is not None:
+            mask_i = labels_np == cls_i
+            mask_j = labels_np == cls_j
+            if mask_i.any() and mask_j.any():
+                ex_i = data_np[mask_i][rng.integers(mask_i.sum())].reshape(image_side, image_side)
+                ex_j = data_np[mask_j][rng.integers(mask_j.sum())].reshape(image_side, image_side)
+                ex_i_disp = ex_i / ex_i.max() if ex_i.max() > 0 else ex_i
+                ex_j_disp = ex_j / ex_j.max() if ex_j.max() > 0 else ex_j
+
+                inset_i = ax.inset_axes([0.02, 0.02, 0.42, 0.42])
+                inset_i.imshow(ex_i_disp, cmap="gray")
+                inset_i.set_title(f"Example class {cls_i}", fontsize=7)
+                inset_i.axis("off")
+
+                inset_j = ax.inset_axes([0.52, 0.02, 0.42, 0.42])
+                inset_j.imshow(ex_j_disp, cmap="gray")
+                inset_j.set_title(f"Example class {cls_j}", fontsize=7)
+                inset_j.axis("off")
+
+    plt.tight_layout()
+    fig.savefig(out_path, dpi=300)
+    plt.close(fig)
+
+
+def save_outlier_pairs_csv(outliers: List[Dict[str, float]], out_csv: Path):
+    if not outliers:
+        return
+    df = pd.DataFrame(outliers)
+    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv, index=False)

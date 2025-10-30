@@ -36,7 +36,7 @@ mse:
   n_bins: 5
 
 cka:
-  enabled: true
+  enabled: false
   n_max: 5000
   permutation:
     enabled: false
@@ -44,27 +44,43 @@ cka:
 
 behavioral:
   enabled: true
-  train_pickle: circle_dataset_100x100/binary_de_wind_train.pkl
-  test_pickle: circle_dataset_100x100/binary_de_wind_test.pkl
-  mat_file: NumStim_7to28_100x100_TE.mat
+  train_pickle: behavioral_datasets/binary_de_wind_train.pkl
+  test_pickle: behavioral_datasets/binary_de_wind_test.pkl
+  mat_file: circle_dataset_100x100/NumStim_7to28_100x100_TE.mat
   guess_rate: 0.01
   tasks:
     comparison:
-      enabled: false
+      enabled: true
       guess_rate: 0.01
+      train_pickle: behavioral_datasets/binary_de_wind_train.pkl
+      test_pickle: behavioral_datasets/binary_de_wind_test.pkl
+      mat_file: circle_dataset_100x100/NumStim_7to28_100x100_TE.mat
     fixed_reference:
-      enabled: false
+      enabled: true
       references: [8, 14, 16, 20]
-      train_template: circle_dataset_100x100/fixed_ref_REF_{ref}_TR.pkl
-      test_template: circle_dataset_100x100/fixed_ref_REF_{ref}_TE.pkl
-      mat_file: NumStim_7to28_100x100_TE.mat
+      train_template: behavioral_datasets/fixed_ref_REF_{ref}_train.pkl
+      test_template: behavioral_datasets/fixed_ref_REF_{ref}_test.pkl
+      mat_file: circle_dataset_100x100/NumStim_1to32_100x100_TE.mat
       guess_rate: 0.01
+    estimation:
+      enabled: true
+      datasets:
+        uniform:
+          train_pickle: behavioral_datasets/naming_train.pkl
+          test_pickle: behavioral_datasets/naming_test.pkl
+        zipfian:
+          train_pickle: behavioral_datasets/naming_train.pkl
+          test_pickle: behavioral_datasets/naming_test.pkl
+      classifiers: [SGD_regression]
+      label_mode: int
+      scale_targets: false
+      max_display_classes: 32
 
 models:
   - arch: iDBN_1500_500
     distribution: uniform
     dataset_path: /home/student/Desktop/Groundeep/stimuli_dataset_10_10
     dataset_name: stimuli_dataset.npz
-    model_uniform: /home/student/Desktop/Groundeep/networks/uniform/idbn_new_dataset_200_epochs_i_dbn_trained_uniform_1500_500.pkl
+    model_uniform: /home/student/Desktop/Groundeep/networks/uniform/dataset_10_10/idbn_new_dataset_200_epochs_i_dbn_trained_uniform_1500_500.pkl
     model_zipfian: /home/student/Desktop/Groundeep/networks/zipfian/idbn_new_dataset_200_epochs_i_dbn_trained_zipfian_1500_500.pkl
     val_size: 0.10

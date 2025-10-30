@@ -87,7 +87,7 @@ def _irls_fit(
 
 
 def _beta_extraction(choice, idxs, mat_contents, guess_rate: float = 0.01):
-    idxs_np = idxs.view(-1, 2).cpu().numpy().astype(int) - 1
+    idxs_np = idxs.view(-1, 2).detach().cpu().numpy().astype(int) - 1
     N_list = np.squeeze(mat_contents["N_list"])
     TSA_list = np.squeeze(mat_contents["TSA_list"])
     FA_list = np.squeeze(mat_contents["FA_list"])

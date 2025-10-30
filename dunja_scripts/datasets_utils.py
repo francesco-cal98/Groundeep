@@ -9,7 +9,10 @@ import scipy
 from scipy.stats import norm
 import torch
 import h5py
-import tensorflow as tf
+try:
+    import tensorflow as tf  # type: ignore
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    tf = None
 import matplotlib.pyplot as plt
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')

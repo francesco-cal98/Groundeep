@@ -432,6 +432,8 @@ def log_linear_probe(
         model.wandb_run.log({f"probe/{layer_tag or 'top'}/summary": wandb.Image(fig)})
         plt.close(fig)
 
+    return summary_rows
+
 
 def log_joint_linear_probe(
     model,
