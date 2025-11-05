@@ -150,6 +150,9 @@ def plot_ordinal_trajectory_1d(class_means: np.ndarray, classes: np.ndarray, out
         return {"spearman_r_1d": np.nan, "p": np.nan}
     pca = PCA(n_components=1, random_state=42).fit(class_means)
     s = pca.transform(class_means).reshape(-1)
+    rho_raw, _ = spearmanr(classes, s)
+    if not np.isnan(rho_raw) and rho_raw < 0:
+        s *= -1
     order = np.argsort(classes)
     s_ord = s[order]
     c_ord = classes[order]
@@ -170,6 +173,12 @@ def plot_ordinal_trajectory_2d(class_means: np.ndarray, classes: np.ndarray, out
         return
     pca = PCA(n_components=2, random_state=42).fit(class_means)
     s2 = pca.transform(class_means)
+    rho_pc1, _ = spearmanr(classes, s2[:, 0])
+    if not np.isnan(rho_pc1) and rho_pc1 < 0:
+        s2[:, 0] *= -1
+    rho_pc2, _ = spearmanr(classes, s2[:, 1])
+    if not np.isnan(rho_pc2) and rho_pc2 < 0:
+        s2[:, 1] *= -1
     order = np.argsort(classes)
     c_ord = classes[order]
     s2_ord = s2[order]

@@ -213,55 +213,64 @@ def train_linear_classifier(
     Ritorna:
       acc_val_best, y_true (val), y_pred (val)
     """
-    D = X_train.shape[1]
-    model = nn.Linear(D, n_classes).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    def _run(inner_device: torch.device):
+        D = X_train.shape[1]
+        model = nn.Linear(D, n_classes).to(inner_device)
+        opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    Xtr = torch.tensor(X_train, dtype=torch.float32, device=device)
-    ytr = torch.tensor(y_train, dtype=torch.long, device=device)
-    Xva = torch.tensor(X_val,   dtype=torch.float32, device=device)
-    yva = torch.tensor(y_val,   dtype=torch.long,   device=device)
+        Xtr = torch.tensor(X_train, dtype=torch.float32, device=inner_device)
+        ytr = torch.tensor(y_train, dtype=torch.long, device=inner_device)
+        Xva = torch.tensor(X_val,   dtype=torch.float32, device=inner_device)
+        yva = torch.tensor(y_val,   dtype=torch.long,   device=inner_device)
 
-    best_loss = float("inf")
-    best_state = None
-    no_improve = 0
+        best_loss = float("inf")
+        best_state = None
+        no_improve = 0
 
-    model.train()
-    for _ in range(max_steps):
-        # train
-        opt.zero_grad()
-        logits = model(Xtr)
-        loss = F.cross_entropy(logits, ytr)
-        loss.backward()
-        opt.step()
+        model.train()
+        for _ in range(max_steps):
+            opt.zero_grad()
+            logits = model(Xtr)
+            loss = F.cross_entropy(logits, ytr)
+            loss.backward()
+            opt.step()
 
-        # val
+            model.eval()
+            with torch.no_grad():
+                v_logits = model(Xva)
+                v_loss = F.cross_entropy(v_logits, yva).item()
+            model.train()
+
+            if v_loss < best_loss - min_delta:
+                best_loss = v_loss
+                best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+                no_improve = 0
+            else:
+                no_improve += 1
+                if no_improve >= patience:
+                    break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
         model.eval()
         with torch.no_grad():
-            v_logits = model(Xva)
-            v_loss = F.cross_entropy(v_logits, yva).item()
-        model.train()
+            logits = model(Xva)
+            preds = torch.argmax(logits, dim=1)
+            acc = (preds == yva).float().mean().item()
 
-        # early stopping su v_loss
-        if v_loss < best_loss - min_delta:
-            best_loss = v_loss
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            no_improve = 0
-        else:
-            no_improve += 1
-            if no_improve >= patience:
-                break
+        return acc, yva.detach().cpu().tolist(), preds.detach().cpu().tolist()
 
-    # eval finale con best_state
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    model.eval()
-    with torch.no_grad():
-        logits = model(Xva)
-        preds = torch.argmax(logits, dim=1)
-        acc = (preds == yva).float().mean().item()
-
-    return acc, yva.detach().cpu().tolist(), preds.detach().cpu().tolist()
+    try:
+        return _run(device)
+    except RuntimeError as exc:
+        msg = str(exc)
+        is_cuda = device.type == "cuda"
+        oom = "CUDA out of memory" in msg or "CUBLAS_STATUS_ALLOC_FAILED" in msg
+        if is_cuda and oom:
+            print("[probe] CUDA OOM detected, retrying linear probe on CPU…")
+            torch.cuda.empty_cache()
+            return _run(torch.device("cpu"))
+        raise
 
 
 # -------------------------
@@ -373,7 +382,7 @@ def log_linear_probe(
     if "density" in feats:
         probe_targets.append("density")
 
-    summary_rows = []
+    summary_rows: list[dict[str, object]] = []
 
     for mkey in probe_targets:
         # 1) target binned (stesso numero di livelli) + nomi dei bin
@@ -401,10 +410,16 @@ def log_linear_probe(
             min_delta=min_delta,
         )
 
-        summary_rows.append((metric_name, acc))
-
         # 4) Confusion matrix "Excel-like" (DataFrame con nomi bin)
         df = _confusion_df(y_true, y_pred, n_classes, bin_names)
+
+        summary_rows.append(
+            {
+                "metric": metric_name,
+                "accuracy": acc,
+                "confusion": df.copy(),
+            }
+        )
 
         # 5) Log: SOLO accuracy finale + tabella confusion + (edges opzionali) + CSV locale
         _log_accuracy_wandb(model.wandb_run, metric_name, acc, epoch)
@@ -419,8 +434,8 @@ def log_linear_probe(
                 model.wandb_run.log({f"probe/{metric_name}/confusion_csv_path": csv_path, "epoch": epoch})
 
     if summary_rows and model.wandb_run and wandb is not None:
-        labels = [name for name, _ in summary_rows]
-        values = [val for _, val in summary_rows]
+        labels = [str(row["metric"]) for row in summary_rows]
+        values = [float(row["accuracy"]) for row in summary_rows]
         fig, ax = plt.subplots(figsize=(max(6, len(labels) * 1.2), 4))
         ax.bar(range(len(labels)), values, color='steelblue')
         ax.set_xticks(range(len(labels)))

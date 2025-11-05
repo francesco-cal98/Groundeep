@@ -9,7 +9,7 @@ reductions:
   pca:   {enabled: true}
   tsne:  {enabled: false}
   mds:   {enabled: false}
-  umap:  {enabled: false}
+  umap:  {enabled: true}
 
 probing:
   enabled: true
@@ -20,7 +20,11 @@ probing:
   lr: 0.01
   patience: 20
 
-rsa: {enabled: true, alpha: 0.01}
+rsa:
+  enabled: true
+  alpha: 0.01
+  metric: cosine
+  dump_rdms: false
 rdm: {enabled: true, metrics: [cosine, euclidean]}
 monotonicity: {enabled: true}
 partial_rsa: {enabled: true}
@@ -31,13 +35,31 @@ traversal:
   steps: 7
   delta: 2.0
 
+pca_geometry:
+  enabled: true
+  per_class: 200
+  isomap: false
+
 mse:
   enabled: true
   n_bins: 5
 
+afp:
+  enabled: true
+  n_bins: 5
+
+ssim:
+  enabled: true
+  n_bins: 5
+
 cka:
-  enabled: false
-  n_max: 5000
+  enabled: true
+  kernels: [linear]
+  n_max: 1024
+  report:
+    enabled: true
+    bootstrap: 0
+    null_permutations: 0
   permutation:
     enabled: false
     n_perm: 200
@@ -81,6 +103,13 @@ models:
     distribution: uniform
     dataset_path: /home/student/Desktop/Groundeep/stimuli_dataset_10_10
     dataset_name: stimuli_dataset.npz
-    model_uniform: /home/student/Desktop/Groundeep/networks/uniform/dataset_10_10/idbn_new_dataset_200_epochs_i_dbn_trained_uniform_1500_500.pkl
-    model_zipfian: /home/student/Desktop/Groundeep/networks/zipfian/idbn_new_dataset_200_epochs_i_dbn_trained_zipfian_1500_500.pkl
+    model_uniform: /home/student/Desktop/Groundeep/networks/uniform/dataset_10_10/uniform_i_/dbn_trained_uniform_1500_500.pkl
+    model_zipfian: /home/student/Desktop/Groundeep/networks/zipfian/dataset_10_10/zipfian_i_/dbn_trained_zipfian_1500_500.pkl
+    val_size: 0.10
+  - arch: iDBN_1500_500
+    distribution: zipfian 
+    dataset_path: /home/student/Desktop/Groundeep/stimuli_dataset_10_10
+    dataset_name: stimuli_dataset.npz
+    model_uniform: /home/student/Desktop/Groundeep/networks/uniform/dataset_10_10/uniform_i_/dbn_trained_uniform_1500_500.pkl
+    model_zipfian: /home/student/Desktop/Groundeep/networks/zipfian/dataset_10_10/zipfian_i_/dbn_trained_zipfian_1500_500.pkl
     val_size: 0.10

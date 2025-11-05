@@ -1,9 +1,10 @@
 # src/main_scripts/analyze.py
 # Unified offline analysis runner (Hydra) che RIUSA le tue funzioni.
 
-import os, math, warnings, sys, json
+import os, math, warnings, sys, json, time
 from pathlib import Path
-from typing import Dict, Any, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, Any, Optional, Tuple, Iterable, List
 
 import numpy as np
 import pandas as pd
@@ -46,6 +47,7 @@ from src.utils.probe_utils import (
 
 # ==== Riduzioni (sklearn / umap) ====
 from sklearn.decomposition import PCA
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.manifold import TSNE, MDS
 try:
     import umap  # pip install umap-learn
@@ -54,8 +56,8 @@ except Exception:
     _HAS_UMAP = False
 
 # ==== Stat/RSA utils (dal tuo runner “robust” che avevi incollato) ====
-from scipy.spatial.distance import pdist
-from scipy.stats import kendalltau, spearmanr, linregress
+from scipy.spatial.distance import pdist, squareform
+from scipy.stats import kendalltau, spearmanr, linregress, rankdata
 from statsmodels.stats.multitest import multipletests
 from sklearn.metrics import pairwise_distances
 
@@ -79,6 +81,20 @@ from src.analyses.mse_viz import (
     plot_mse_heatmap,
     plot_mse_vs_numerosity,
     save_regression_results,
+)
+from src.analyses.afp_viz import (
+    compute_sample_afp,
+    prepare_afp_dataframe,
+    plot_afp_heatmap,
+    plot_afp_vs_numerosity,
+    save_afp_regression_results,
+)
+from src.analyses.ssim_viz import (
+    compute_sample_ssim,
+    prepare_ssim_dataframe,
+    plot_ssim_heatmap,
+    plot_ssim_vs_numerosity,
+    save_ssim_regression_results,
 )
 
 from src.analyses.powerfit_pairs import (
@@ -108,6 +124,115 @@ from src.analyses.task_numerosity_estimation import (
     run_task_numerosity_estimation,
 )
 from src.datasets.uniform_dataset import compute_label_histogram, plot_label_histogram
+from src.analyses.pca_report import generate_pca_decomposition_report
+from src.analyses.pca_geometry import run_pca_geometry
+
+
+# =========================
+# Data classes
+# =========================
+@dataclass(slots=True)
+class ModelSpec:
+    """Hydra-friendly specification for a single model to analyse."""
+
+    arch_name: str
+    distribution: str
+    dataset_path: Path
+    dataset_name: str
+    model_uniform: Path
+    model_zipfian: Path
+    val_size: float = 0.05
+
+    @classmethod
+    def from_config(cls, raw_cfg: Dict[str, Any], project_root: Path) -> "ModelSpec":
+        """Resolve a Hydra model config into a strongly typed specification."""
+        def _abs(value: Optional[str]) -> Path:
+            if value is None:
+                return project_root
+            candidate = Path(value)
+            return candidate if candidate.is_absolute() else (project_root / candidate).resolve()
+
+        return cls(
+            arch_name=str(raw_cfg["arch"]),
+            distribution=str(raw_cfg["distribution"]),
+            dataset_path=_abs(raw_cfg["dataset_path"]),
+            dataset_name=str(raw_cfg.get("dataset_name", "stimuli_dataset.npz")),
+            model_uniform=_abs(raw_cfg["model_uniform"]),
+            model_zipfian=_abs(raw_cfg["model_zipfian"]),
+            val_size=float(raw_cfg.get("val_size", 0.05)),
+        )
+
+
+@dataclass(slots=True)
+class AnalysisSettings:
+    """Bundle all optional analysis knobs in a single container."""
+
+    reductions: Dict[str, Any] = field(default_factory=dict)
+    probing: Dict[str, Any] = field(default_factory=dict)
+    rsa: Dict[str, Any] = field(default_factory=dict)
+    rdm: Dict[str, Any] = field(default_factory=dict)
+    monotonicity: Dict[str, Any] = field(default_factory=dict)
+    partial_rsa: Dict[str, Any] = field(default_factory=dict)
+    traversal: Dict[str, Any] = field(default_factory=dict)
+    cka: Dict[str, Any] = field(default_factory=dict)
+    mse: Dict[str, Any] = field(default_factory=dict)
+    afp: Dict[str, Any] = field(default_factory=dict)
+    ssim: Dict[str, Any] = field(default_factory=dict)
+    pca_geometry: Dict[str, Any] = field(default_factory=dict)
+    behavioral: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_cfg(cls, cfg: Dict[str, Any]) -> "AnalysisSettings":
+        """Create a settings bundle starting from a nested dict/DictConfig."""
+        def _to_dict(name: str) -> Dict[str, Any]:
+            section = cfg.get(name, {})
+            if isinstance(section, DictConfig):
+                return OmegaConf.to_container(section, resolve=True)  # type: ignore[arg-type]
+            return dict(section) if isinstance(section, dict) else {}
+
+        return cls(
+            reductions=_to_dict("reductions"),
+            probing=_to_dict("probing"),
+            rsa=_to_dict("rsa"),
+            rdm=_to_dict("rdm"),
+            monotonicity=_to_dict("monotonicity"),
+            partial_rsa=_to_dict("partial_rsa"),
+            traversal=_to_dict("traversal"),
+            cka=_to_dict("cka"),
+            mse=_to_dict("mse"),
+            afp=_to_dict("afp"),
+            ssim=_to_dict("ssim"),
+            pca_geometry=_to_dict("pca_geometry"),
+            behavioral=_to_dict("behavioral"),
+        )
+
+
+@dataclass(slots=True)
+class EmbeddingBundle:
+    """Container with the activations and accompanying geometric features."""
+
+    embeddings: np.ndarray
+    labels: np.ndarray
+    cum_area: np.ndarray
+    convex_hull: np.ndarray
+    inputs: torch.Tensor
+    mean_item_size: Optional[np.ndarray] = None
+    density: Optional[np.ndarray] = None
+
+
+@dataclass(slots=True)
+class ModelAnalysisContext:
+    """Runtime artefacts gathered before launching the heavy analyses."""
+
+    spec: ModelSpec
+    analyzer: Embedding_analysis
+    bundle: EmbeddingBundle
+    output_dir: Path
+    seed: int
+    wandb_run: Optional[Any]
+    base_batch: torch.Tensor
+    orig_flat: np.ndarray
+    image_shape: Tuple[int, int, int]
 
 # =========================
 # Helper per device/model
@@ -167,6 +292,1246 @@ def _aggregate_delta_curve(df: pd.DataFrame) -> pd.DataFrame:
     data["distance"] = data["distance"].astype(float)
     grouped = data.groupby("deltaN", as_index=False)["distance"].median()
     return grouped.sort_values("deltaN").reset_index(drop=True)
+
+
+def _maybe_init_wandb(use_wandb: bool, project: Optional[str], run_name: Optional[str]):
+    """Try to initialise a Weights & Biases run if requested."""
+    if not use_wandb:
+        return None
+    try:
+        import wandb
+
+        return wandb.init(project=project, name=run_name, reinit=True)
+    except Exception:
+        return None
+
+
+def _finish_wandb(wandb_run) -> None:
+    """Safely close a Weights & Biases run."""
+    if wandb_run is None:
+        return
+    try:
+        wandb_run.finish()
+    except Exception:
+        pass
+
+
+def _as_numpy(values, dtype: Optional[np.dtype] = None) -> np.ndarray:
+    """Convert optional nested iterables into a 1-D NumPy array."""
+    if values is None:
+        return np.array([])
+    arr = np.asarray(values)
+    if dtype is not None:
+        arr = arr.astype(dtype, copy=False)
+    return arr
+
+
+def _extract_embedding_bundle(analyzer: Embedding_analysis, dist_name: str) -> EmbeddingBundle:
+    """
+    Collect the activations and auxiliary geometric variables for the given distribution.
+
+    The embedding loader already guarantees that tensors are aligned across features.
+    """
+    outputs = analyzer._get_encodings()
+    Z = _as_numpy(outputs.get(f"Z_{dist_name}"), dtype=np.float64)
+    labels = _as_numpy(outputs.get(f"labels_{dist_name}"))
+    cum_area = _as_numpy(outputs.get(f"cumArea_{dist_name}"), dtype=np.float64)
+    convex_hull = _as_numpy(outputs.get(f"CH_{dist_name}"), dtype=np.float64)
+    bundle = EmbeddingBundle(
+        embeddings=Z,
+        labels=labels,
+        cum_area=cum_area,
+        convex_hull=convex_hull,
+        inputs=analyzer.inputs_uniform,
+    )
+
+    density_key = f"density_{dist_name}"
+    if density_key in outputs:
+        bundle.density = _as_numpy(outputs[density_key], dtype=np.float64)
+
+    mean_size_key_candidates = [
+        f"mean_item_size_{dist_name}",
+        f"meanItemSize_{dist_name}",
+        f"mean_size_{dist_name}",
+    ]
+    for key in mean_size_key_candidates:
+        if key in outputs:
+            bundle.mean_item_size = _as_numpy(outputs[key], dtype=np.float64)
+            break
+
+    return bundle
+
+
+def _save_label_histograms(analyzer: Embedding_analysis, out_dir: Path) -> None:
+    """Persist label histograms for both training regimes when available."""
+    hist_dir = out_dir / "label_histograms"
+    hist_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        plot_label_histogram(
+            np.asarray(analyzer.dataset_uniform.labels),
+            title="Label Histogram (uniform)",
+            save_path=hist_dir / "uniform.png",
+        )
+    except Exception as exc:
+        print(f"[Labels] Impossibile generare histogramma uniform: {exc}")
+    try:
+        plot_label_histogram(
+            np.asarray(analyzer.dataset_zipfian.labels),
+            title="Label Histogram (zipfian)",
+            save_path=hist_dir / "zipfian.png",
+        )
+    except Exception as exc:
+        print(f"[Labels] Impossibile generare histogramma zipfian: {exc}")
+
+
+def _build_probe_features(
+    analyzer: Embedding_analysis,
+    bundle: EmbeddingBundle,
+    out_dir: Path,
+    arch_name: str,
+    dist_name: str,
+) -> Tuple[Dict[str, np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
+    """
+    Assemble the feature dictionary consumed by the linear probes and emit correlation plots.
+    """
+    ds = analyzer.val_dataloader_uniform.dataset
+    idxs = getattr(ds, "indices", np.arange(len(ds)))
+    base = getattr(ds, "dataset", ds)
+
+    def _maybe_collect(attr: str):
+        if hasattr(base, attr):
+            values = getattr(base, attr)
+            return [values[i] for i in idxs]
+        return None
+
+    cum_area_list = _maybe_collect("cumArea_list")
+    ch_list = _maybe_collect("CH_list")
+    density_list = _maybe_collect("density_list")
+    mean_size_list = _maybe_collect("mean_item_size_list")
+
+    features_for_probes: Dict[str, np.ndarray] = {}
+    if cum_area_list is not None:
+        features_for_probes["Cumulative Area"] = np.asarray(cum_area_list)
+    if ch_list is not None:
+        features_for_probes["Convex Hull"] = np.asarray(ch_list)
+    if density_list is not None:
+        features_for_probes["Density"] = np.asarray(density_list)
+    if mean_size_list is not None:
+        features_for_probes["Mean Item Size"] = np.asarray(mean_size_list)
+    if bundle.labels is not None and bundle.labels.size:
+        features_for_probes["Labels"] = np.asarray(bundle.labels)
+
+    feature_dir = out_dir / "feature_analysis"
+    feature_dir.mkdir(parents=True, exist_ok=True)
+    corr_features: Dict[str, np.ndarray] = {}
+    if bundle.labels.size:
+        corr_features["labels"] = bundle.labels.astype(float)
+    if bundle.cum_area.size:
+        corr_features["cumArea"] = bundle.cum_area.astype(float)
+    if bundle.convex_hull.size:
+        corr_features["CH"] = bundle.convex_hull.astype(float)
+
+    density_arr = features_for_probes.get("Density")
+    density_np: Optional[np.ndarray] = None
+    if isinstance(density_arr, np.ndarray) and len(density_arr) == bundle.labels.size:
+        density_np = density_arr.astype(float)
+        corr_features["Density"] = density_np
+
+    mean_arr: Optional[np.ndarray] = None
+    mean_values = features_for_probes.get("Mean Item Size")
+    if isinstance(mean_values, np.ndarray) and len(mean_values) == bundle.labels.size:
+        mean_arr = mean_values.astype(float)
+        corr_features["mean_item_size"] = mean_arr
+
+    if corr_features:
+        corr_df = pd.DataFrame(corr_features)
+        rename_map = {
+            "labels": "Numerosity",
+            "cumArea": "Cumulative Area",
+            "CH": "Convex Hull",
+            "Density": "Density",
+            "mean_item_size": "Mean Item Size",
+        }
+        corr_df.rename(columns=rename_map, inplace=True)
+        if "Numerosity" in corr_df:
+            mask = corr_df["Numerosity"] > 5
+            corr_df = corr_df[mask]
+        corr_matrix = corr_df.corr(method="kendall")
+        corr_matrix.to_csv(feature_dir / f"feature_correlations_{dist_name}.csv")
+        plt.figure(figsize=(6, 4))
+        sns.heatmap(
+            corr_matrix,
+            annot=True,
+            fmt=".2f",
+            cmap="viridis",
+            cbar=True,
+            square=True,
+        )
+        plt.title(f"Feature Correlations — {arch_name} ({dist_name})")
+        plt.xticks(rotation=45, ha="right")
+        plt.yticks(rotation=0)
+        plt.tight_layout()
+        plt.savefig(feature_dir / f"feature_correlations_{dist_name}.png", dpi=300)
+        plt.close()
+
+    return features_for_probes, density_np, mean_arr
+
+
+def _run_linear_probes(
+    analyzer: Embedding_analysis,
+    features_for_probes: Dict[str, np.ndarray],
+    *,
+    arch_name: str,
+    dist_name: str,
+    out_dir: Path,
+    probing_cfg: Dict[str, Any],
+    seed: int,
+    wandb_run=None,
+) -> None:
+    """Execute the linear probes on the requested layers and save visual summaries."""
+    model_for_probe = analyzer.model_uniform if dist_name == "uniform" else analyzer.model_zipfian
+    if not probing_cfg.get("enabled", True):
+        return
+    layers = probing_cfg.get("layers", ["top"])
+    for layer in layers:
+        upto = None if str(layer).lower() == "top" else int(layer)
+        layer_tag = "top" if upto is None else f"layer{upto}"
+        probe_dir = out_dir / "probes" / layer_tag
+        prm = ProbeReadyModel(
+            raw_model=model_for_probe,
+            val_loader=analyzer.val_dataloader_uniform,
+            features_dict=features_for_probes,
+            out_dir=probe_dir,
+            wandb_run=wandb_run,
+        )
+        summary_rows = log_linear_probe(
+            model=prm,
+            epoch=0,
+            n_bins=int(probing_cfg.get("n_bins", 5)),
+            test_size=float(probing_cfg.get("test_size", 0.2)),
+            steps=int(probing_cfg.get("steps", 1000)),
+            lr=float(probing_cfg.get("lr", 1e-2)),
+            rng_seed=int(seed),
+            patience=int(probing_cfg.get("patience", 20)),
+            min_delta=0.0,
+            save_csv=True,
+            upto_layer=upto,
+            layer_tag=layer_tag,
+        )
+        if not summary_rows:
+            continue
+
+        probe_dir.mkdir(parents=True, exist_ok=True)
+        records = [
+            {"metric": str(row.get("metric")), "accuracy": float(row.get("accuracy", 0.0))}
+            for row in summary_rows
+        ]
+        df_probe = pd.DataFrame(records)
+        df_probe.to_csv(probe_dir / "probe_summary.csv", index=False)
+
+        fig, ax = plt.subplots(figsize=(max(6, len(records) * 1.2), 4))
+        order = df_probe["metric"].tolist()
+        sns.barplot(
+            data=df_probe,
+            x="metric",
+            y="accuracy",
+            color="steelblue",
+            errorbar=None,
+            ax=ax,
+            order=order,
+        )
+        ax.set_ylim(0, 1.05)
+        ax.set_ylabel("Accuracy")
+        ax.set_xlabel("")
+        ax.set_xticklabels(ax.get_xticklabels(), rotation=45, ha="right")
+        ax.set_title(f"Linear probe accuracy — {arch_name} ({dist_name}) [{layer_tag}]")
+        labels_fmt = [f"{val:.2f}" for val in df_probe["accuracy"]]
+        bar_containers = getattr(ax, "containers", None)
+        if bar_containers:
+            try:
+                ax.bar_label(bar_containers[0], labels=labels_fmt, padding=3, fontsize=10)
+            except Exception:
+                bar_containers = None
+        if not bar_containers:
+            for patch, label in zip(ax.patches, labels_fmt):
+                ax.annotate(
+                    label,
+                    (
+                        patch.get_x() + patch.get_width() / 2,
+                        min(patch.get_height() + 0.02, ax.get_ylim()[1] - 0.01),
+                    ),
+                    ha="center",
+                    va="bottom",
+                    fontsize=10,
+                )
+        fig.tight_layout()
+        fig.savefig(probe_dir / "probe_summary.png", dpi=300)
+        plt.close(fig)
+
+        for row in summary_rows:
+            conf_df = row.get("confusion")
+            if not isinstance(conf_df, pd.DataFrame):
+                continue
+            cm_counts = conf_df.values.astype(float)
+            row_sums = cm_counts.sum(axis=1, keepdims=True)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                cm_norm = np.divide(cm_counts, row_sums, where=row_sums > 0)
+            cm_plot = pd.DataFrame(cm_norm, index=conf_df.index, columns=conf_df.columns)
+            fig_cm, ax_cm = plt.subplots(figsize=(6, 5))
+            sns.heatmap(
+                cm_plot,
+                annot=True,
+                fmt=".2f",
+                cmap="viridis",
+                cbar=True,
+                vmin=0.0,
+                vmax=1.0,
+                ax=ax_cm,
+            )
+            ax_cm.set_xlabel("Predicted")
+            ax_cm.set_ylabel("True")
+            ax_cm.set_title(f"Probe confusion ({arch_name} – {dist_name} – {row['metric']})")
+            ax_cm.set_xticklabels(ax_cm.get_xticklabels(), rotation=45, ha="right")
+            ax_cm.set_yticklabels(ax_cm.get_yticklabels(), rotation=0)
+            fig_cm.tight_layout()
+            safe_metric = str(row["metric"]).replace("/", "_").replace(" ", "_")
+            fig_cm.savefig(probe_dir / f"{safe_metric}_confusion.png", dpi=300)
+            plt.close(fig_cm)
+
+
+def _run_layerwise_analysis(
+    ctx: ModelAnalysisContext,
+    settings: AnalysisSettings,
+    *,
+    density: Optional[np.ndarray],
+    mean_item_size: Optional[np.ndarray],
+    anchor_idx: int,
+) -> None:
+    """
+    Execute per-layer analyses (reductions, monotonicity, reconstruction metrics, RSA, traversal, etc.).
+    """
+    arch_name = ctx.spec.arch_name
+    dist_name = ctx.spec.distribution
+    analyzer = ctx.analyzer
+    bundle = ctx.bundle
+    labels = bundle.labels
+    cumArea = bundle.cum_area
+    CH = bundle.convex_hull
+    wandb_run = ctx.wandb_run
+    seed = ctx.seed
+    out_dir = ctx.output_dir
+    inputs_cpu = ctx.base_batch
+    channels, img_h, img_w = ctx.image_shape
+    orig_flat = ctx.orig_flat
+
+    red_flags = settings.reductions or {}
+    mse_cfg = settings.mse or {}
+    afp_cfg = settings.afp or {}
+    ssim_cfg = settings.ssim or {}
+    cka_cfg = settings.cka or {}
+    pca_geom_cfg = settings.pca_geometry or {}
+    rsa_cfg = settings.rsa or {}
+    rdm_cfg = settings.rdm or {}
+    monotonicity_cfg = settings.monotonicity or {}
+    partial_rsa_cfg = settings.partial_rsa or {}
+    tr_cfg = settings.traversal or {}
+    rsa_metric = str(rsa_cfg.get("metric", "cosine")).lower()
+    rsa_dump_rdms = bool(rsa_cfg.get("dump_rdms", False))
+
+    model_sel = analyzer.model_uniform if dist_name == "uniform" else analyzer.model_zipfian
+    layers = getattr(model_sel, "layers", [])
+    if not layers:
+        return
+
+    device = _get_model_device(model_sel)
+    layer_reps: List[np.ndarray] = []
+    layer_states: List[torch.Tensor] = []
+    with torch.no_grad():
+        inputs_device = inputs_cpu.to(device).view(inputs_cpu.shape[0], -1)
+        cur = inputs_device
+        for li, rbm in enumerate(layers, start=1):
+            cur = rbm.forward(cur)
+            layer_states.append(cur.detach())
+            layer_reps.append(cur.detach().cpu().numpy())
+        del inputs_device
+
+    for li, (Zl, layer_state) in enumerate(zip(layer_reps, layer_states), start=1):
+        ldir = out_dir / "layers" / f"layer{li}"
+        ldir.mkdir(parents=True, exist_ok=True)
+
+        mono_l = ldir / "monotonicity"
+        mono_l.mkdir(parents=True, exist_ok=True)
+        cm_l, cls_l = compute_class_centroids(Zl, labels)
+        D_l = pairwise_centroid_distances(cm_l, metric="euclidean")
+        stats_l1 = plot_distance_vs_deltaN(D_l, cls_l, mono_l / "deltaN_vs_distance.png")
+        plot_violin_by_deltaN(D_l, cls_l, mono_l / "violin_by_deltaN.png")
+        plot_centroid_heatmap(D_l, cls_l, mono_l / "centroid_heatmap.png")
+        stats_l2 = plot_ordinal_trajectory_1d(cm_l, cls_l, mono_l / "ordinal_trajectory_1d.png")
+        plot_ordinal_trajectory_2d(cm_l, cls_l, mono_l / "ordinal_trajectory_2d.png")
+        save_deltaN_stats_csv(D_l, cls_l, mono_l / "deltaN_stats.csv")
+        outliers_info = stats_l1.get("outliers", []) if isinstance(stats_l1, dict) else []
+        if outliers_info:
+            plot_outlier_pairs(
+                analyzer.dataset_uniform,
+                cm_l,
+                cls_l,
+                outliers_info,
+                mono_l / "outlier_pairs.png",
+            )
+            save_outlier_pairs_csv(outliers_info, mono_l / "outlier_pairs.csv")
+        stats_summary = {k: v for k, v in stats_l1.items() if k != "outliers"} if isinstance(stats_l1, dict) else {}
+        stats_summary.update(stats_l2 if isinstance(stats_l2, dict) else {})
+        if stats_summary:
+            pd.DataFrame([stats_summary]).to_csv(mono_l / "monotonicity_summary.csv", index=False)
+        if wandb_run is not None:
+            try:
+                import wandb
+
+                payload = {
+                    f"monotonicity/layer{li}/deltaN_vs_distance": wandb.Image(str(mono_l / "deltaN_vs_distance.png")),
+                    f"monotonicity/layer{li}/violin_by_deltaN": wandb.Image(str(mono_l / "violin_by_deltaN.png")),
+                    f"monotonicity/layer{li}/centroid_heatmap": wandb.Image(str(mono_l / "centroid_heatmap.png")),
+                    f"monotonicity/layer{li}/ordinal_trajectory_1d": wandb.Image(str(mono_l / "ordinal_trajectory_1d.png")),
+                    f"monotonicity/layer{li}/ordinal_trajectory_2d": wandb.Image(str(mono_l / "ordinal_trajectory_2d.png")),
+                }
+                if outliers_info:
+                    payload[f"monotonicity/layer{li}/outlier_pairs"] = wandb.Image(str(mono_l / "outlier_pairs.png"))
+                wandb_run.log(payload)
+            except Exception:
+                pass
+
+        red_dir_l = ldir / "reductions"
+        red_dir_l.mkdir(parents=True, exist_ok=True)
+        reductions_l = compute_reductions(
+            Zl,
+            labels=labels,
+            seed=seed,
+            enable_tsne=bool(red_flags.get("tsne", {}).get("enabled", True)),
+            enable_mds=bool(red_flags.get("mds", {}).get("enabled", True)),
+            enable_umap=bool(red_flags.get("umap", {}).get("enabled", False)),
+        )
+
+        feature_corr_dict: Dict[str, np.ndarray] = {
+            "Labels": labels,
+            "cumArea": cumArea,
+            "CH": CH,
+        }
+        if density is not None:
+            feature_corr_dict["Density"] = density
+        if mean_item_size is not None:
+            feature_corr_dict["MeanItemSize"] = mean_item_size.astype(float)
+
+        for name, emb in reductions_l.items():
+            method = name.split("_")[0].upper()
+            method_slug = method.lower()
+            if emb.shape[1] == 2:
+                _ = plot_2d_embedding_and_correlations(
+                    emb_2d=emb,
+                    features=feature_corr_dict,
+                    arch_name=arch_name,
+                    dist_name=f"{dist_name}/layer{li}",
+                    method_name=method,
+                    wandb_run=wandb_run,
+                    save_path=red_dir_l / f"{method_slug}_2d_overview.png",
+                )
+            if emb.shape[1] == 3:
+                _ = plot_3d_embedding_and_correlations(
+                    emb_3d=emb,
+                    features=feature_corr_dict,
+                    arch_name=arch_name,
+                    dist_name=f"{dist_name}/layer{li}",
+                    method_name=method,
+                    wandb_run=wandb_run,
+                    save_path=red_dir_l / f"{method_slug}_3d_overview.png",
+                )
+        try:
+            pca_diag_dir = ldir / "pca_diagnostics"
+            _run_pca_diagnostics(Zl, labels, pca_diag_dir, prefix=f"{arch_name}_{dist_name}_layer{li}")
+        except Exception as exc:
+            print(f"[PCA diag] {arch_name}/{dist_name}/layer{li}: failed ({exc})")
+        if pca_geom_cfg.get("enabled", True):
+            try:
+                geom_dir = ldir / "pca_geometry"
+                run_pca_geometry(
+                    Zl,
+                    labels.astype(int, copy=False),
+                    geom_dir,
+                    tag=f"{arch_name}_{dist_name}_layer{li}",
+                    per_class=int(pca_geom_cfg.get("per_class", 200)),
+                    run_isomap=bool(pca_geom_cfg.get("isomap", False)),
+                )
+            except Exception as exc:
+                print(f"[PCA geometry] {arch_name}/{dist_name}/layer{li}: failed ({exc})")
+        try:
+            pca_viz_dir = ldir / "pca"
+            generate_pca_decomposition_report(
+                Zl,
+                labels,
+                regime_name=dist_name,
+                layer_tag=f"layer{li}",
+                out_dir=pca_viz_dir,
+            )
+        except Exception as exc:
+            print(f"[PCA viz] {arch_name}/{dist_name}/layer{li}: failed ({exc})")
+
+        if mse_cfg.get("enabled", True):
+            mse_dir = ldir / "mse"
+            mse_dir.mkdir(parents=True, exist_ok=True)
+            recon_tensor = layer_state.view(layer_state.shape[0], -1).cpu()
+            recon_flat = recon_tensor.view(orig_flat.shape[0], -1).numpy()
+            mses = compute_sample_mse(orig_flat, recon_flat)
+            df_mse, bin_info_mse = prepare_mse_dataframe(
+                labels=labels,
+                cum_area=cumArea,
+                convex_hull=CH,
+                density=density,
+                mean_item_size=mean_item_size,
+                mse_values=mses,
+                cfg=mse_cfg,
+            )
+            df_mse.to_csv(mse_dir / "mse_samples.csv", index=False)
+            plot_mse_heatmap(df_mse, mse_dir / "heatmap_cumarea_vs_numerosity.png", feature_col="cum_area_bin")
+            plot_mse_heatmap(df_mse, mse_dir / "heatmap_convex_hull_vs_numerosity.png", feature_col="convex_hull_bin")
+            if density is not None:
+                plot_mse_heatmap(df_mse, mse_dir / "heatmap_density_vs_numerosity.png", feature_col="density_bin")
+            plot_mse_vs_numerosity(
+                df_mse,
+                feature_col="cum_area_bin",
+                out_path=mse_dir / "mse_vs_numerosity_by_cumarea.png",
+                title=f"{arch_name} - {dist_name} - Layer {li} - MSE vs numerosity (cum area)",
+            )
+            plot_mse_vs_numerosity(
+                df_mse,
+                feature_col="convex_hull_bin",
+                out_path=mse_dir / "mse_vs_numerosity_by_convex_hull.png",
+                title=f"{arch_name} - {dist_name} - Layer {li} - MSE vs numerosity (convex hull)",
+            )
+            if density is not None:
+                plot_mse_vs_numerosity(
+                    df_mse,
+                    feature_col="density_bin",
+                    out_path=mse_dir / "mse_vs_numerosity_by_density.png",
+                    title=f"{arch_name} - {dist_name} - Layer {li} - MSE vs numerosity (density)",
+                )
+            mse_stats = {
+                "mean_mse": float(df_mse["mse"].mean()),
+                "std_mse": float(df_mse["mse"].std()),
+                "n_samples": int(df_mse.shape[0]),
+            }
+            pd.DataFrame([mse_stats]).to_csv(mse_dir / "mse_summary.csv", index=False)
+            with open(mse_dir / "bin_info.json", "w", encoding="utf-8") as f:
+                json.dump(_serialize_bin_info(bin_info_mse), f, indent=2)
+            coeff_mse, summary_mse, reg_mse = save_regression_results(df_mse, mse_dir)
+            if wandb_run is not None:
+                try:
+                    import wandb
+
+                    payload = {
+                        f"mse/layer{li}/mean_mse": mse_stats["mean_mse"],
+                        f"mse/layer{li}/std_mse": mse_stats["std_mse"],
+                        f"mse/layer{li}/heatmap_cumarea": wandb.Image(str(mse_dir / "heatmap_cumarea_vs_numerosity.png")),
+                        f"mse/layer{li}/heatmap_convex_hull": wandb.Image(str(mse_dir / "heatmap_convex_hull_vs_numerosity.png")),
+                    }
+                    density_plot = mse_dir / "heatmap_density_vs_numerosity.png"
+                    if density is not None and density_plot.exists():
+                        payload[f"mse/layer{li}/heatmap_density"] = wandb.Image(str(density_plot))
+                    wandb_run.log(payload)
+                    coeff_table = wandb.Table(dataframe=coeff_mse)
+                    wandb_run.log({
+                        f"mse/layer{li}/regression_coefficients": coeff_table,
+                        f"mse/layer{li}/regression_summary": wandb.Html(f"<pre>{summary_mse}</pre>"),
+                        f"mse/layer{li}/regression_r2": reg_mse.get("r2", math.nan),
+                        f"mse/layer{li}/regression_adj_r2": reg_mse.get("adj_r2", math.nan),
+                    })
+                except Exception:
+                    pass
+
+        if afp_cfg.get("enabled", True):
+            afp_dir = ldir / "afp"
+            afp_dir.mkdir(parents=True, exist_ok=True)
+            recon_tensor = layer_state.view(layer_state.shape[0], -1).cpu()
+            recon_flat = recon_tensor.view(orig_flat.shape[0], -1).numpy()
+            if channels > 1:
+                recon_images = recon_flat.reshape(orig_flat.shape[0], channels, img_h, img_w)
+                orig_images = orig_flat.reshape(orig_flat.shape[0], channels, img_h, img_w)
+            else:
+                recon_images = recon_flat.reshape(orig_flat.shape[0], img_h, img_w)
+                orig_images = orig_flat.reshape(orig_flat.shape[0], img_h, img_w)
+            afp_vals = compute_sample_afp(orig_images, recon_images)
+            df_afp, bin_info_afp = prepare_afp_dataframe(
+                labels=labels,
+                cum_area=cumArea,
+                convex_hull=CH,
+                density=density,
+                mean_item_size=mean_item_size,
+                afp_values=afp_vals,
+                cfg=afp_cfg,
+            )
+            df_afp.to_csv(afp_dir / "afp_samples.csv", index=False)
+            plot_afp_heatmap(df_afp, afp_dir / "heatmap_cumarea_vs_numerosity.png", feature_col="cum_area_bin")
+            plot_afp_heatmap(df_afp, afp_dir / "heatmap_convex_hull_vs_numerosity.png", feature_col="convex_hull_bin")
+            if density is not None:
+                plot_afp_heatmap(df_afp, afp_dir / "heatmap_density_vs_numerosity.png", feature_col="density_bin")
+            plot_afp_vs_numerosity(
+                df_afp,
+                feature_col="cum_area_bin",
+                out_path=afp_dir / "afp_vs_numerosity_by_cumarea.png",
+                title=f"{arch_name} - {dist_name} - Layer {li} - AFP vs numerosity (cum area)",
+            )
+            plot_afp_vs_numerosity(
+                df_afp,
+                feature_col="convex_hull_bin",
+                out_path=afp_dir / "afp_vs_numerosity_by_convex_hull.png",
+                title=f"{arch_name} - {dist_name} - Layer {li} - AFP vs numerosity (convex hull)",
+            )
+            if density is not None:
+                plot_afp_vs_numerosity(
+                    df_afp,
+                    feature_col="density_bin",
+                    out_path=afp_dir / "afp_vs_numerosity_by_density.png",
+                    title=f"{arch_name} - {dist_name} - Layer {li} - AFP vs numerosity (density)",
+                )
+            coeff_afp, summary_afp, reg_afp = save_afp_regression_results(df_afp, afp_dir)
+            afp_stats = {
+                "mean_afp": float(df_afp["afp"].mean()),
+                "std_afp": float(df_afp["afp"].std()),
+                "n_samples": int(df_afp.shape[0]),
+            }
+            pd.DataFrame([afp_stats]).to_csv(afp_dir / "afp_summary.csv", index=False)
+            with open(afp_dir / "bin_info.json", "w", encoding="utf-8") as f:
+                json.dump(_serialize_bin_info(bin_info_afp), f, indent=2)
+            if wandb_run is not None:
+                try:
+                    import wandb
+
+                    payload = {
+                        f"afp/layer{li}/mean_afp": afp_stats["mean_afp"],
+                        f"afp/layer{li}/std_afp": afp_stats["std_afp"],
+                        f"afp/layer{li}/heatmap_cumarea": wandb.Image(str(afp_dir / "heatmap_cumarea_vs_numerosity.png")),
+                        f"afp/layer{li}/heatmap_convex_hull": wandb.Image(str(afp_dir / "heatmap_convex_hull_vs_numerosity.png")),
+                    }
+                    density_plot = afp_dir / "heatmap_density_vs_numerosity.png"
+                    if density is not None and density_plot.exists():
+                        payload[f"afp/layer{li}/heatmap_density"] = wandb.Image(str(density_plot))
+                    wandb_run.log(payload)
+                    coeff_table = wandb.Table(dataframe=coeff_afp)
+                    wandb_run.log({
+                        f"afp/layer{li}/regression_coefficients": coeff_table,
+                        f"afp/layer{li}/regression_summary": wandb.Html(f"<pre>{summary_afp}</pre>"),
+                        f"afp/layer{li}/regression_r2": reg_afp.get("r2", math.nan),
+                        f"afp/layer{li}/regression_adj_r2": reg_afp.get("adj_r2", math.nan),
+                    })
+                except Exception:
+                    pass
+
+        if ssim_cfg.get("enabled", True):
+            ssim_dir = ldir / "ssim"
+            ssim_dir.mkdir(parents=True, exist_ok=True)
+            recon_tensor = layer_state.view(layer_state.shape[0], -1).cpu()
+            recon_flat = recon_tensor.view(orig_flat.shape[0], -1).numpy()
+            if channels > 1:
+                recon_images = recon_flat.reshape(orig_flat.shape[0], channels, img_h, img_w)
+                orig_images = orig_flat.reshape(orig_flat.shape[0], channels, img_h, img_w)
+            else:
+                recon_images = recon_flat.reshape(orig_flat.shape[0], img_h, img_w)
+                orig_images = orig_flat.reshape(orig_flat.shape[0], img_h, img_w)
+            ssim_vals = compute_sample_ssim(orig_images, recon_images)
+            df_ssim, bin_info_ssim = prepare_ssim_dataframe(
+                labels=labels,
+                cum_area=cumArea,
+                convex_hull=CH,
+                density=density,
+                mean_item_size=mean_item_size,
+                ssim_values=ssim_vals,
+                cfg=ssim_cfg,
+            )
+            df_ssim.to_csv(ssim_dir / "ssim_samples.csv", index=False)
+            plot_ssim_heatmap(df_ssim, ssim_dir / "heatmap_cumarea_vs_numerosity.png", feature_col="cum_area_bin")
+            plot_ssim_heatmap(df_ssim, ssim_dir / "heatmap_convex_hull_vs_numerosity.png", feature_col="convex_hull_bin")
+            if density is not None:
+                plot_ssim_heatmap(df_ssim, ssim_dir / "heatmap_density_vs_numerosity.png", feature_col="density_bin")
+            plot_ssim_vs_numerosity(
+                df_ssim,
+                feature_col="cum_area_bin",
+                out_path=ssim_dir / "ssim_vs_numerosity_by_cumarea.png",
+                title=f"{arch_name} - {dist_name} - Layer {li} - SSIM vs numerosity (cum area)",
+            )
+            plot_ssim_vs_numerosity(
+                df_ssim,
+                feature_col="convex_hull_bin",
+                out_path=ssim_dir / "ssim_vs_numerosity_by_convex_hull.png",
+                title=f"{arch_name} - {dist_name} - Layer {li} - SSIM vs numerosity (convex hull)",
+            )
+            if density is not None:
+                plot_ssim_vs_numerosity(
+                    df_ssim,
+                    feature_col="density_bin",
+                    out_path=ssim_dir / "ssim_vs_numerosity_by_density.png",
+                    title=f"{arch_name} - {dist_name} - Layer {li} - SSIM vs numerosity (density)",
+                )
+            coeff_ssim, summary_ssim, reg_ssim = save_ssim_regression_results(df_ssim, ssim_dir)
+            ssim_stats = {
+                "mean_ssim": float(df_ssim["ssim"].mean()),
+                "std_ssim": float(df_ssim["ssim"].std()),
+                "n_samples": int(df_ssim.shape[0]),
+            }
+            pd.DataFrame([ssim_stats]).to_csv(ssim_dir / "ssim_summary.csv", index=False)
+            with open(ssim_dir / "bin_info.json", "w", encoding="utf-8") as f:
+                json.dump(_serialize_bin_info(bin_info_ssim), f, indent=2)
+            if wandb_run is not None:
+                try:
+                    import wandb
+
+                    payload = {
+                        f"ssim/layer{li}/heatmap_cumarea": wandb.Image(str(ssim_dir / "heatmap_cumarea_vs_numerosity.png")),
+                        f"ssim/layer{li}/heatmap_convex_hull": wandb.Image(str(ssim_dir / "heatmap_convex_hull_vs_numerosity.png")),
+                        f"ssim/layer{li}/mean_ssim": ssim_stats["mean_ssim"],
+                        f"ssim/layer{li}/std_ssim": ssim_stats["std_ssim"],
+                    }
+                    if density is not None:
+                        density_plot = ssim_dir / "heatmap_density_vs_numerosity.png"
+                        if density_plot.exists():
+                            payload[f"ssim/layer{li}/heatmap_density"] = wandb.Image(str(density_plot))
+                    for name, path in (
+                        ("cumarea", ssim_dir / "ssim_vs_numerosity_by_cumarea.png"),
+                        ("convex_hull", ssim_dir / "ssim_vs_numerosity_by_convex_hull.png"),
+                        ("density", ssim_dir / "ssim_vs_numerosity_by_density.png"),
+                    ):
+                        if path.exists():
+                            payload[f"ssim/layer{li}/ssim_vs_numerosity_{name}"] = wandb.Image(str(path))
+                    wandb_run.log(payload)
+                    coeff_table = wandb.Table(dataframe=coeff_ssim)
+                    wandb_run.log({
+                        f"ssim/layer{li}/regression_coefficients": coeff_table,
+                        f"ssim/layer{li}/regression_summary": wandb.Html(f"<pre>{summary_ssim}</pre>"),
+                        f"ssim/layer{li}/regression_r2": reg_ssim.get("r2", math.nan),
+                        f"ssim/layer{li}/regression_adj_r2": reg_ssim.get("adj_r2", math.nan),
+                    })
+                except Exception:
+                    pass
+
+        del layer_state
+
+        if (rsa_cfg or {}).get("enabled", True):
+            run_rsa_with_fdr(
+                Zl,
+                {"labels": labels, "cumArea": cumArea, "CH": CH},
+                arch_name,
+                f"{dist_name}_layer{li}",
+                ldir,
+                alpha=float(rsa_cfg.get("alpha", 0.01)),
+                metric=rsa_metric,
+                dump_rdms=rsa_dump_rdms,
+            )
+        if (rdm_cfg or {}).get("enabled", True):
+            for metric_name in rdm_cfg.get("metrics", ["cosine", "euclidean"]):
+                pairwise_class_rdm(Zl, labels, arch_name, f"{dist_name}_layer{li}", ldir, metric=metric_name)
+        if (monotonicity_cfg or {}).get("enabled", True):
+            mon = monotonicity_deltaN(Zl, labels)
+            pd.DataFrame([mon]).to_csv(ldir / "monotonicity.csv", index=False)
+        if (partial_rsa_cfg or {}).get("enabled", True):
+            prs = partial_rsa_numerosity(
+                Zl,
+                labels,
+                {"cumArea": cumArea, "CH": CH},
+                metric=rsa_metric,
+            )
+            pd.DataFrame([prs]).to_csv(ldir / "partial_rsa.csv", index=False)
+        if tr_cfg.get("enabled", True):
+            latent_dir_l = ldir / "latent"
+            latent_dir_l.mkdir(parents=True, exist_ok=True)
+            pcs = tuple(tr_cfg.get("pcs", [0, 1]))
+            steps_tr = int(tr_cfg.get("steps", 7))
+            delta_tr = float(tr_cfg.get("delta", 2.0))
+            latent_grid_on_pca(
+                model_sel,
+                Zl,
+                ctx.base_batch,
+                latent_dir_l / "grid_pc0_pc1.png",
+                anchor_idx=anchor_idx,
+                pcs=pcs,
+                steps=steps_tr,
+                delta=delta_tr,
+                seed=seed,
+                start_layer=li,
+            )
+
+
+def _run_powerfit_pairs(ctx: ModelAnalysisContext) -> None:
+    """Fit the power-law relationship between centroid distances and numerosity."""
+    pf_dir = ctx.output_dir / "powerfit_pairs"
+    pf_dir.mkdir(parents=True, exist_ok=True)
+    Z = ctx.bundle.embeddings
+    labels = ctx.bundle.labels
+    x_pairs, y_pairs, pairs_df = build_pairwise_xy(Z, labels, metric="euclidean")
+    pairs_df.to_csv(pf_dir / f"pairs_table_{ctx.spec.arch_name}_{ctx.spec.distribution}.csv", index=False)
+    if x_pairs.size == 0:
+        print(f"[PowerFit] {ctx.spec.arch_name}/{ctx.spec.distribution}: no valid centroid pairs for fitting.")
+        return
+
+    fit = fit_power_loglog_pairs(x_pairs, y_pairs)
+    save_pairs_fit(fit, pf_dir / f"params_{ctx.spec.arch_name}_{ctx.spec.distribution}.csv")
+    plot_pairs_fit(
+        x_pairs,
+        y_pairs,
+        fit,
+        pf_dir / f"fit_linear_{ctx.spec.arch_name}_{ctx.spec.distribution}.png",
+        f"{ctx.spec.arch_name} ({ctx.spec.distribution})",
+    )
+    plot_pairs_fit_loglog(
+        x_pairs,
+        y_pairs,
+        fit,
+        pf_dir / f"fit_loglog_{ctx.spec.arch_name}_{ctx.spec.distribution}.png",
+        f"{ctx.spec.arch_name} ({ctx.spec.distribution})",
+    )
+    print(f"[PowerFit] {ctx.spec.arch_name}/{ctx.spec.distribution}: b={fit['b']:.3f}, R²={fit['r2']:.3f}")
+    if ctx.wandb_run is not None:
+        try:
+            import wandb
+
+            ctx.wandb_run.log(
+                {
+                    "powerfit_pairs/fit_linear": wandb.Image(
+                        str(pf_dir / f"fit_linear_{ctx.spec.arch_name}_{ctx.spec.distribution}.png")
+                    ),
+                    "powerfit_pairs/fit_loglog": wandb.Image(
+                        str(pf_dir / f"fit_loglog_{ctx.spec.arch_name}_{ctx.spec.distribution}.png")
+                    ),
+                    "powerfit_pairs/b": fit["b"],
+                    "powerfit_pairs/r2": fit["r2"],
+                }
+            )
+        except Exception:
+            pass
+
+
+def _run_cka_analysis(ctx: ModelAnalysisContext, settings: AnalysisSettings) -> None:
+    """Compute CKA between uniform and zipfian models and optionally produce the rich report."""
+    cka_cfg = settings.cka or {}
+    if not cka_cfg.get("enabled", True):
+        print(f"[CKA] {ctx.spec.arch_name}/{ctx.spec.distribution}: skipped (cka.enabled=False)")
+        return
+
+    analyzer = ctx.analyzer
+    uniform_layers = getattr(analyzer.model_uniform, "layers", [])
+    zipf_layers = getattr(analyzer.model_zipfian, "layers", [])
+    max_layers = min(len(uniform_layers), len(zipf_layers))
+    if max_layers <= 0:
+        print(f"[CKA] {ctx.spec.arch_name}/{ctx.spec.distribution}: no layers available for comparison.")
+        return
+
+    layers_for_cka = list(range(1, max_layers + 1))
+    base_inputs_flat_tensor = analyzer.inputs_uniform.view(analyzer.inputs_uniform.shape[0], -1).to(torch.float32)
+    models_for_cka = {
+        "uniform": analyzer.model_uniform,
+        "zipfian": analyzer.model_zipfian,
+    }
+    repr_cache: Dict[Tuple[int, str], np.ndarray] = {}
+
+    def _repr(layer_idx: int, model_tag: str) -> np.ndarray:
+        key = (layer_idx, model_tag)
+        if key in repr_cache:
+            return repr_cache[key]
+        model = models_for_cka[model_tag]
+        layers_model = getattr(model, "layers", [])
+        upto = min(layer_idx, len(layers_model))
+        device = _get_model_device(model)
+        with torch.no_grad():
+            cur = base_inputs_flat_tensor.to(device)
+            for rbm in layers_model[:upto]:
+                cur = rbm.forward(cur)
+            arr = cur.detach().cpu().float().cpu().numpy()
+        repr_cache[key] = arr
+        return arr
+
+    cka_dir = ctx.output_dir / "cka"
+    cka_dir.mkdir(parents=True, exist_ok=True)
+
+    rng = np.random.default_rng(ctx.seed)
+    subset_idx = None
+    n_max = cka_cfg.get("n_max")
+    if n_max is not None:
+        n_max = int(n_max)
+        if base_inputs_flat_tensor.shape[0] > n_max:
+            subset_idx = np.sort(rng.choice(base_inputs_flat_tensor.shape[0], size=n_max, replace=False))
+
+    t0 = time.perf_counter()
+    kernels_to_run = cka_cfg.get("kernels") or ["linear", "rbf"]
+    do_linear = "linear" in kernels_to_run
+    do_rbf = "rbf" in kernels_to_run
+
+    if do_linear:
+        M_lin, namesA, namesB = compute_layerwise_cka(
+            _repr,
+            layers_for_cka,
+            layers_for_cka,
+            tag_A="uniform",
+            tag_B="zipfian",
+            indices=subset_idx,
+            kind="linear",
+            rng=rng,
+        )
+        t_lin = time.perf_counter() - t0
+        lin_df = pd.DataFrame(M_lin, index=namesA, columns=namesB)
+        lin_csv = cka_dir / f"cka_linear_{ctx.spec.arch_name}.csv"
+        lin_df.to_csv(lin_csv)
+        lin_png = cka_dir / f"cka_linear_{ctx.spec.arch_name}.png"
+        plot_cka_heatmap(M_lin, namesA, namesB, f"Linear CKA — {ctx.spec.arch_name} (uniform vs zipf)", lin_png)
+    else:
+        M_lin = lin_df = None
+        lin_png = None
+        t_lin = 0.0
+
+    if do_rbf:
+        t0 = time.perf_counter()
+        M_rbf, _, _ = compute_layerwise_cka(
+            _repr,
+            layers_for_cka,
+            layers_for_cka,
+            tag_A="uniform",
+            tag_B="zipfian",
+            indices=subset_idx,
+            kind="rbf",
+            rng=rng,
+        )
+        t_rbf = time.perf_counter() - t0
+        rbf_df = pd.DataFrame(M_rbf, index=namesA, columns=namesB)
+        rbf_csv = cka_dir / f"cka_rbf_{ctx.spec.arch_name}.csv"
+        rbf_df.to_csv(rbf_csv)
+        rbf_png = cka_dir / f"cka_rbf_{ctx.spec.arch_name}.png"
+        plot_cka_heatmap(M_rbf, namesA, namesB, f"RBF CKA — {ctx.spec.arch_name} (uniform vs zipf)", rbf_png)
+    else:
+        M_rbf = None
+        rbf_png = None
+        t_rbf = 0.0
+
+    msg = f"[CKA] {ctx.spec.arch_name}/{ctx.spec.distribution}:"
+    if M_lin is not None:
+        msg += f" diag linear={np.diag(M_lin).mean():.3f} (time {t_lin:.1f}s)"
+    if M_rbf is not None:
+        msg += f", diag rbf={np.diag(M_rbf).mean():.3f} (time {t_rbf:.1f}s)"
+    print(msg)
+
+    if ctx.wandb_run is not None:
+        try:
+            import wandb
+
+            payload = {}
+            if lin_png is not None:
+                payload["cka/linear"] = wandb.Image(str(lin_png))
+            if rbf_png is not None:
+                payload["cka/rbf"] = wandb.Image(str(rbf_png))
+            if payload:
+                ctx.wandb_run.log(payload)
+        except Exception:
+            pass
+
+    perm_cfg = cka_cfg.get("permutation") or {}
+    if perm_cfg.get("enabled", False):
+        n_perm = int(perm_cfg.get("n_perm", 200))
+        perm_rng = np.random.default_rng(ctx.seed)
+        records = []
+        for layer in layers_for_cka:
+            Xa = _repr(layer, "uniform")
+            Yb = _repr(layer, "zipfian")
+            if subset_idx is not None:
+                Xa = Xa[subset_idx]
+                Yb = Yb[subset_idx]
+            p_lin = permutation_test_cka(Xa, Yb, n_perm=n_perm, kind="linear", rng=perm_rng)
+            if do_rbf:
+                p_rbf = permutation_test_cka(Xa, Yb, n_perm=n_perm, kind="rbf", rng=perm_rng)
+            else:
+                p_rbf = np.nan
+            records.append(
+                {
+                    "layer": layer,
+                    "p_linear": p_lin,
+                    "p_rbf": p_rbf,
+                }
+            )
+        pd.DataFrame(records).to_csv(cka_dir / f"cka_permutation_{ctx.spec.arch_name}.csv", index=False)
+
+    report_cfg = cka_cfg.get("report", {})
+    if report_cfg.get("enabled", True):
+        try:
+            report_dir = cka_dir / "report"
+            acts_uniform_report: List[np.ndarray] = []
+            acts_zipf_report: List[np.ndarray] = []
+            for layer in layers_for_cka:
+                Xa = _repr(layer, "uniform")
+                Yb = _repr(layer, "zipfian")
+                if subset_idx is not None:
+                    Xa = Xa[subset_idx]
+                    Yb = Yb[subset_idx]
+                acts_uniform_report.append(Xa)
+                acts_zipf_report.append(Yb)
+
+            generate_report(
+                acts_uniform_report,
+                acts_zipf_report,
+                outdir=report_dir,
+                layer_names_uniform=namesA,
+                layer_names_zipf=namesB,
+                kernels=report_cfg.get("kernels", ["linear", "rbf"]),
+                gamma=report_cfg.get("gamma"),
+                bootstrap=int(report_cfg.get("bootstrap", 200)),
+                ridge_tau=float(report_cfg.get("ridge_tau", 0.1)),
+                null_permutations=int(report_cfg.get("null_permutations", 1000)),
+                seed=int(report_cfg.get("seed", ctx.seed)),
+            )
+        except Exception as exc:
+            print(f"[CKA report] Impossibile generare gli asset slide-ready ({exc})")
+
+
+def _run_behavioral_suite(
+    ctx: ModelAnalysisContext,
+    behavioral_cfg: Dict[str, Any],
+) -> None:
+    """Execute the optional behavioural tasks (comparison, fixed ref, estimation)."""
+    if not behavioral_cfg.get("enabled", False):
+        return
+
+    tasks_cfg = behavioral_cfg.get("tasks", {}) if isinstance(behavioral_cfg, dict) else {}
+    model_for_behavior = ctx.analyzer.model_uniform if ctx.spec.distribution == "uniform" else ctx.analyzer.model_zipfian
+    behaviors_dir = ctx.output_dir / "behavioral"
+    behavior_label = f"{ctx.spec.arch_name}_{ctx.spec.distribution}"
+    behavioral_inputs = None
+    device_behavior: Optional[torch.device] = None
+
+    train_path = behavioral_cfg.get("train_pickle")
+    test_path = behavioral_cfg.get("test_pickle")
+    mat_path = behavioral_cfg.get("mat_file")
+    if train_path and test_path and mat_path:
+        try:
+            device_behavior = _get_model_device(model_for_behavior)
+            behavioral_inputs = load_behavioral_inputs(
+                Path(train_path),
+                Path(test_path),
+                Path(mat_path),
+                device_behavior,
+            )
+        except Exception as exc:
+            print(f"[Behavioral] Impossibile caricare i dataset ({exc})")
+    else:
+        print("[Behavioral] Percorsi mancanti: train_pickle/test_pickle/mat_file")
+
+    if behavioral_inputs is None:
+        return
+
+    results_beh = run_behavioral_analysis(
+        model_for_behavior,
+        behavioral_inputs,
+        behaviors_dir,
+        behavior_label,
+        guess_rate=float(behavioral_cfg.get("guess_rate", 0.01)),
+    )
+    if ctx.wandb_run is not None:
+        try:
+            import wandb
+
+            ctx.wandb_run.log(
+                {
+                    "behavioral/accuracy_test": results_beh.get("accuracy_test"),
+                    "behavioral/accuracy_train": results_beh.get("accuracy_train"),
+                    "behavioral/beta_number": results_beh.get("beta_number"),
+                    "behavioral/beta_size": results_beh.get("beta_size"),
+                    "behavioral/beta_spacing": results_beh.get("beta_spacing"),
+                    "behavioral/weber_fraction": results_beh.get("weber_fraction"),
+                }
+            )
+        except Exception:
+            pass
+
+    comparison_cfg = tasks_cfg.get("comparison", {})
+    if comparison_cfg.get("enabled", False):
+        out_cmp = behaviors_dir / "comparison"
+        guess_rate_cmp = float(comparison_cfg.get("guess_rate", behavioral_cfg.get("guess_rate", 0.01)))
+        try:
+            comparison_inputs = behavioral_inputs
+            cmp_train = comparison_cfg.get("train_pickle")
+            cmp_test = comparison_cfg.get("test_pickle")
+            if cmp_train and cmp_test:
+                cmp_mat = comparison_cfg.get("mat_file") or behavioral_cfg.get("mat_file")
+                comparison_inputs = load_behavioral_inputs(
+                    Path(cmp_train),
+                    Path(cmp_test),
+                    Path(cmp_mat) if cmp_mat else Path(behavioral_cfg.get("mat_file")),
+                    device_behavior or _get_model_device(model_for_behavior),
+                )
+            results_cmp = run_task_comparison(
+                model_for_behavior,
+                comparison_inputs,
+                out_cmp,
+                behavior_label,
+                guess_rate=guess_rate_cmp,
+            )
+            if ctx.wandb_run is not None:
+                ctx.wandb_run.log(
+                    {
+                        "behavioral/comparison/accuracy_test": results_cmp.get("accuracy_test"),
+                        "behavioral/comparison/accuracy_train": results_cmp.get("accuracy_train"),
+                        "behavioral/comparison/weber_fraction": results_cmp.get("weber_fraction"),
+                        "behavioral/comparison/beta_number": results_cmp.get("beta_number"),
+                    }
+                )
+        except Exception as exc:
+            print(f"[Behavioral] Task comparison fallito: {exc}")
+
+    fixed_cfg = tasks_cfg.get("fixed_reference", {})
+    if fixed_cfg.get("enabled", False):
+        refs = fixed_cfg.get("references", [])
+        train_template = fixed_cfg.get("train_template")
+        test_template = fixed_cfg.get("test_template")
+        mat_path = fixed_cfg.get("mat_file") or behavioral_cfg.get("mat_file")
+        if not (train_template and test_template and mat_path):
+            print("[Behavioral] Percorsi mancanti per fixed_reference")
+        else:
+            for ref in refs:
+                try:
+                    train_path = Path(train_template.format(ref=ref))
+                    test_path = Path(test_template.format(ref=ref))
+                    fixed_inputs = load_fixed_reference_inputs(
+                        train_path,
+                        test_path,
+                        Path(mat_path),
+                        device_behavior or _get_model_device(model_for_behavior),
+                    )
+                    results_fixed = run_task_fixed_reference(
+                        model_for_behavior,
+                        fixed_inputs,
+                        behaviors_dir / "fixed_reference",
+                        behavior_label,
+                        ref_num=int(ref),
+                        guess_rate=float(fixed_cfg.get("guess_rate", behavioral_cfg.get("guess_rate", 0.01))),
+                    )
+                    if ctx.wandb_run is not None:
+                        ctx.wandb_run.log(
+                            {
+                                f"behavioral/fixed_reference/{ref}/accuracy_test": results_fixed.get("accuracy_test"),
+                                f"behavioral/fixed_reference/{ref}/weber_fraction": results_fixed.get("weber_fraction"),
+                            }
+                        )
+                except Exception as exc:
+                    print(f"[Behavioral] Fixed reference {ref} fallito: {exc}")
+
+    estimation_cfg = tasks_cfg.get("estimation", {})
+    if not estimation_cfg.get("enabled", False):
+        return
+
+    ds_map = estimation_cfg.get("datasets")
+    if isinstance(ds_map, DictConfig):
+        ds_map = OmegaConf.to_container(ds_map, resolve=True)
+    ds_entry = None
+    if isinstance(ds_map, dict):
+        ds_entry = ds_map.get(ctx.spec.distribution) or ds_map.get("default") or ds_map.get("all")
+    if ds_entry is None:
+        ds_entry = {
+            "train_pickle": estimation_cfg.get("train_pickle"),
+            "test_pickle": estimation_cfg.get("test_pickle"),
+        }
+    if isinstance(ds_entry, DictConfig):
+        ds_entry = OmegaConf.to_container(ds_entry, resolve=True)
+    train_est = ds_entry.get("train_pickle")
+    test_est = ds_entry.get("test_pickle")
+    if not (train_est and test_est):
+        print(f"[Behavioral] Dataset numerosity estimation mancante per {ctx.spec.distribution}")
+        return
+
+    try:
+        train_est_path = Path(train_est)
+        if not train_est_path.is_absolute():
+            train_est_path = PROJECT_ROOT / train_est_path
+        test_est_path = Path(test_est)
+        if not test_est_path.is_absolute():
+            test_est_path = PROJECT_ROOT / test_est_path
+        device_est = _get_model_device(model_for_behavior)
+        train_ds = load_estimation_dataset(train_est_path, device_est)
+        test_ds = load_estimation_dataset(test_est_path, device_est)
+        est_dir = behaviors_dir / "estimation"
+        est_summary = run_task_numerosity_estimation(
+            model_for_behavior,
+            train_ds,
+            test_ds,
+            est_dir,
+            behavior_label,
+            classifiers=estimation_cfg.get("classifiers"),
+            label_mode=estimation_cfg.get("label_mode", "int"),
+            scale_targets=bool(estimation_cfg.get("scale_targets", False)),
+            max_numerosity=estimation_cfg.get("max_numerosity"),
+            distribution=ctx.spec.distribution,
+            max_display_classes=int(estimation_cfg.get("max_display_classes", 32)),
+            wandb_run=ctx.wandb_run,
+        )
+        if ctx.wandb_run is not None and est_summary:
+            try:
+                import wandb
+
+                ctx.wandb_run.log(
+                    {
+                        "behavioral/estimation/results_csv": str(est_summary.get("results_path")),
+                        "behavioral/estimation/per_class_csv": str(est_summary.get("per_class_path")),
+                    }
+                )
+            except Exception:
+                pass
+    except Exception as exc:
+        print(f"[Behavioral] Numerosity estimation fallita ({exc})")
+def _prepare_model_context(
+    spec: ModelSpec,
+    output_root: Path | str,
+    seed: int,
+    *,
+    wandb_run=None,
+) -> ModelAnalysisContext:
+    """
+    Instantiate the embedding extractor and gather all runtime artefacts for downstream steps.
+    """
+    analyzer = Embedding_analysis(
+        path2data=str(spec.dataset_path),
+        data_name=spec.dataset_name,
+        model_uniform=str(spec.model_uniform),
+        model_zipfian=str(spec.model_zipfian),
+        arch_name=spec.arch_name,
+        val_size=spec.val_size,
+    )
+
+    def _loader_dataset(loader):
+        return getattr(loader, "dataset", None) if loader is not None else None
+
+    if spec.distribution.lower() == "zipfian":
+        _report_label_coverage("zipf/train", _loader_dataset(getattr(analyzer, "train_dataloader_zipfian", None)))
+        _report_label_coverage("zipf/val", _loader_dataset(getattr(analyzer, "val_dataloader_zipfian", None)))
+        _report_label_coverage("zipf/test", _loader_dataset(getattr(analyzer, "test_dataloader_zipfian", None)))
+    else:
+        _report_label_coverage("uniform/train", _loader_dataset(getattr(analyzer, "train_dataloader_uniform", None)))
+        _report_label_coverage("uniform/val", _loader_dataset(getattr(analyzer, "val_dataloader_uniform", None)))
+        _report_label_coverage("uniform/test", _loader_dataset(getattr(analyzer, "test_dataloader_uniform", None)))
+
+    bundle = _extract_embedding_bundle(analyzer, spec.distribution)
+
+    inputs_cpu = analyzer.inputs_uniform
+    base_batch = inputs_cpu
+    orig_flat = inputs_cpu.reshape(inputs_cpu.shape[0], -1).numpy()
+    channels, img_h, img_w = _infer_chw_from_input(inputs_cpu)
+    if orig_flat.shape[1] != channels * img_h * img_w:
+        img_h, img_w = _infer_hw_from_batch(inputs_cpu)
+        channels = 1
+
+    out_dir = Path(output_root) / spec.distribution / spec.arch_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    return ModelAnalysisContext(
+        spec=spec,
+        analyzer=analyzer,
+        bundle=bundle,
+        output_dir=out_dir,
+        seed=seed,
+        wandb_run=wandb_run,
+        base_batch=base_batch,
+        orig_flat=orig_flat,
+        image_shape=(channels, img_h, img_w),
+    )
 
 
 def _safe_slope(x: np.ndarray, y: np.ndarray) -> float:
@@ -347,6 +1712,159 @@ def _plot_dispersion_per_deltaN(
     return stats, df_agg
 
 
+def _serialize_bin_info(info: Dict[str, object]) -> Dict[str, object]:
+    def _convert(value):
+        if isinstance(value, dict):
+            return {str(k): _convert(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple, np.ndarray)):
+            return [_convert(v) for v in value]
+        if isinstance(value, (np.integer, int)):
+            return int(value)
+        if isinstance(value, (np.floating, float)):
+            return float(value)
+        return str(value)
+
+    return {key: _convert(value) for key, value in info.items()}
+
+
+def _compute_between_fraction(values: np.ndarray, labels: np.ndarray) -> float:
+    overall_mean = float(np.mean(values))
+    total_ss = float(np.sum((values - overall_mean) ** 2))
+    if total_ss <= 0:
+        return 0.0
+    between_ss = 0.0
+    for lab in np.unique(labels):
+        mask = labels == lab
+        if not np.any(mask):
+            continue
+        group_mean = float(np.mean(values[mask]))
+        between_ss += mask.sum() * (group_mean - overall_mean) ** 2
+    return float(between_ss / total_ss)
+
+
+def _run_pca_diagnostics(
+    Z: np.ndarray,
+    labels: np.ndarray,
+    out_dir: Path,
+    *,
+    prefix: str,
+    n_components: int = 5,
+) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    summary: Dict[str, object] = {}
+
+    labels_float = labels.astype(float)
+    unique_labels = np.unique(labels)
+
+    def _build_entries(pca_obj, scores, tag: str) -> list[Dict[str, float]]:
+        entries = []
+        evr = pca_obj.explained_variance_ratio_
+        for idx in range(min(len(evr), n_components)):
+            pc_scores = scores[:, idx]
+            rho, _ = spearmanr(pc_scores, labels_float)
+            entries.append(
+                {
+                    "pc": int(idx + 1),
+                    "explained_variance_ratio": float(evr[idx]),
+                    "spearman_r_labels": float(rho),
+                    "between_fraction": _compute_between_fraction(pc_scores, labels),
+                }
+            )
+        return entries
+
+    max_components = min(Z.shape[0], Z.shape[1])
+    if max_components == 0:
+        return
+    n_pca = max(1, min(n_components, max_components))
+
+    # Sample PCA
+    pca_samples = PCA(n_components=n_pca)
+    sample_scores = pca_samples.fit_transform(Z)
+    for idx in range(min(n_pca, 2)):
+        rho, _ = spearmanr(sample_scores[:, idx], labels_float)
+        if rho < 0:
+            pca_samples.components_[idx] *= -1
+            sample_scores[:, idx] *= -1
+    summary["samples"] = _build_entries(pca_samples, sample_scores, "samples")
+
+    # Centroid PCA
+    centroid_map: Dict[float, np.ndarray] = {}
+    counts: list[int] = []
+    ordered_labels: list[float] = []
+    for lab in unique_labels:
+        mask = labels == lab
+        if not np.any(mask):
+            continue
+        centroid_map[float(lab)] = Z[mask].mean(axis=0)
+        counts.append(int(mask.sum()))
+        ordered_labels.append(float(lab))
+    if centroid_map:
+        centroid_matrix = np.vstack([centroid_map[lab] for lab in ordered_labels])
+        max_centroid_comp = min(centroid_matrix.shape[0], centroid_matrix.shape[1])
+        n_centroid = max(1, min(n_components, max_centroid_comp))
+        pca_centroids = PCA(n_components=n_centroid)
+        centroid_scores = pca_centroids.fit_transform(centroid_matrix)
+        for idx in range(min(n_centroid, 2)):
+            rho, _ = spearmanr(centroid_scores[:, idx], ordered_labels)
+            if rho < 0:
+                pca_centroids.components_[idx] *= -1
+                centroid_scores[:, idx] *= -1
+        entries = []
+        for idx in range(min(len(pca_centroids.explained_variance_ratio_), n_components)):
+            rho, _ = spearmanr(centroid_scores[:, idx], ordered_labels)
+            entries.append(
+                {
+                    "pc": int(idx + 1),
+                    "explained_variance_ratio": float(pca_centroids.explained_variance_ratio_[idx]),
+                    "spearman_r_labels": float(rho),
+                }
+            )
+        summary["centroids"] = entries
+    else:
+        summary["centroids"] = []
+
+    # Class-centered PCA
+    centered = Z.copy()
+    if centroid_map:
+        for lab, centroid in centroid_map.items():
+            mask = labels == lab
+            if np.any(mask):
+                centered[mask] -= centroid
+    pca_centered = PCA(n_components=n_pca)
+    centered_scores = pca_centered.fit_transform(centered)
+    for idx in range(min(n_pca, 2)):
+        rho, _ = spearmanr(centered_scores[:, idx], labels_float)
+        if rho < 0:
+            pca_centered.components_[idx] *= -1
+            centered_scores[:, idx] *= -1
+    summary["class_centered"] = _build_entries(pca_centered, centered_scores, "class_centered")
+
+    # LDA angle with PC plane
+    angle_deg = None
+    if sample_scores.shape[1] >= 2:
+        try:
+            lda = LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")
+            lda.fit(Z, labels)
+            if hasattr(lda, "scalings_") and lda.scalings_ is not None:
+                lda_axis = np.asarray(lda.scalings_).reshape(-1)
+            else:
+                lda_axis = lda.coef_.ravel()
+            if np.linalg.norm(lda_axis) > 0:
+                lda_axis = lda_axis / np.linalg.norm(lda_axis)
+                pc1 = pca_samples.components_[0]
+                pc2 = pca_samples.components_[1]
+                proj = (np.dot(pc1, lda_axis) * pc1) + (np.dot(pc2, lda_axis) * pc2)
+                proj_norm = np.linalg.norm(proj)
+                proj_norm = np.clip(proj_norm, -1.0, 1.0)
+                angle_deg = float(np.degrees(np.arccos(proj_norm)))
+        except Exception:
+            angle_deg = None
+    summary["lda_angle_deg"] = angle_deg
+
+    with open(out_dir / f"{prefix}_pca_diagnostics.json", "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+
+
 def maybe_generate_monotonicity_comparisons(
     arch_name: str,
     out_root: Path | str,
@@ -469,14 +1987,32 @@ class ProbeReadyModel:
 # =========================
 # Riduzioni (compute)
 # =========================
-def compute_reductions(Z: np.ndarray, seed: int = 42,
+def compute_reductions(Z: np.ndarray,
+                       labels: np.ndarray | None = None,
+                       seed: int = 42,
                        enable_tsne: bool = True,
                        enable_mds: bool = True,
                        enable_umap: bool = True) -> Dict[str, np.ndarray]:
     outs = {}
     if Z.shape[0] >= 2 and Z.shape[1] >= 2:
-        outs["PCA_2"]  = PCA(n_components=2, random_state=seed).fit_transform(Z)
-        outs["PCA_3"]  = PCA(n_components=min(3, Z.shape[1]), random_state=seed).fit_transform(Z)
+        pca2 = PCA(n_components=2, random_state=seed)
+        scores2 = pca2.fit_transform(Z)
+        if labels is not None and scores2.shape[1] >= 1:
+            for dim in range(scores2.shape[1]):
+                rho, _ = spearmanr(scores2[:, dim], labels)
+                if not np.isnan(rho) and rho < 0:
+                    scores2[:, dim] *= -1
+        outs["PCA_2"] = scores2
+
+        pca_dim3 = min(3, Z.shape[1])
+        pca3 = PCA(n_components=pca_dim3, random_state=seed)
+        scores3 = pca3.fit_transform(Z)
+        if labels is not None and scores3.shape[1] >= 1:
+            for dim in range(scores3.shape[1]):
+                rho, _ = spearmanr(scores3[:, dim], labels)
+                if not np.isnan(rho) and rho < 0:
+                    scores3[:, dim] *= -1
+        outs["PCA_3"] = scores3
         if enable_tsne:
             try:
                 outs["TSNE_2"] = TSNE(n_components=2, random_state=seed, init="pca", learning_rate="auto").fit_transform(Z)
@@ -504,15 +2040,21 @@ def compute_reductions(Z: np.ndarray, seed: int = 42,
 def _compute_brain_rdm(embeddings: np.ndarray, metric: str = "cosine") -> np.ndarray:
     if embeddings.shape[0] < 2:
         return np.array([])
-    X = embeddings.copy()
+    X = np.asarray(embeddings, dtype=np.float64)
+    metric = (metric or "cosine").lower()
     if metric == "cosine":
-        X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-12)
-        X = np.nan_to_num(X)
-        return pdist(X, metric="cosine")
+        norms = np.linalg.norm(X, axis=1, keepdims=True)
+        norms = np.where(norms == 0.0, 1.0, norms)
+        Xn = np.nan_to_num(X / norms)
+        return pdist(Xn, metric="cosine")
+    if metric in {"corr", "pearson", "one_minus_corr", "1-corr"}:
+        corr = np.corrcoef(X)
+        dist = 1.0 - corr
+        return squareform(dist, checks=False)
     if metric == "euclidean":
-        X = (X - X.mean(0, keepdims=True)) / (X.std(0, keepdims=True) + 1e-8)
-        return pdist(X, metric="euclidean")
-    raise ValueError("metric not supported")
+        Xc = (X - X.mean(axis=0, keepdims=True)) / (X.std(axis=0, keepdims=True) + 1e-8)
+        return pdist(Xc, metric="euclidean")
+    raise ValueError(f"Unsupported RSA brain metric '{metric}'")
 
 def _compute_model_rdm(values: np.ndarray, metric: str = "euclidean") -> np.ndarray:
     if values is None or len(values) < 2:
@@ -520,25 +2062,49 @@ def _compute_model_rdm(values: np.ndarray, metric: str = "euclidean") -> np.ndar
     x = np.asarray(values, dtype=np.float64).reshape(-1,1)
     return pdist(x, metric=metric)
 
-def run_rsa_with_fdr(Z: np.ndarray, feats: Dict[str, np.ndarray], arch: str, dist: str, out_dir: Path, alpha=0.01):
-    brain = _compute_brain_rdm(Z, metric="cosine")
+def _rank_normalize_rdm(vector: np.ndarray) -> np.ndarray:
+    if vector.size < 2:
+        return vector
+    ranks = rankdata(vector)
+    denom = ranks.max() - ranks.min()
+    if denom <= 0:
+        return np.zeros_like(ranks, dtype=np.float64)
+    return (ranks - ranks.min()) / denom
+
+
+def run_rsa_with_fdr(
+    Z: np.ndarray,
+    feats: Dict[str, np.ndarray],
+    arch: str,
+    dist: str,
+    out_dir: Path,
+    alpha: float = 0.01,
+    *,
+    metric: str = "cosine",
+    dump_rdms: bool = False,
+) -> None:
+    brain = _compute_brain_rdm(Z, metric=metric)
     if brain.size == 0:
         return
+    brain_rank = _rank_normalize_rdm(brain)
     lbl = feats.get("labels", None)
     fdict = {
-        "numerosity_linear": lbl,
-        "numerosity_log1p": np.log1p(lbl) if lbl is not None else None,
-        "cumArea": feats.get("cumArea"),
-        "CH": feats.get("CH"),
+        "Numerosity": lbl,
+        "NumerosityLog": np.log1p(lbl) if lbl is not None else None,
+        "CumArea": feats.get("cumArea"),
+        "ConvexHull": feats.get("CH"),
     }
     rows = []
+    model_vectors: Dict[str, np.ndarray] = {}
     for name, vals in fdict.items():
         if vals is None: continue
         model_rdm = _compute_model_rdm(vals)
         if model_rdm.size == 0 or model_rdm.shape != brain.shape: continue
-        v = np.isfinite(brain) & np.isfinite(model_rdm)
+        model_vectors[name] = model_rdm
+        model_rank = _rank_normalize_rdm(model_rdm)
+        v = np.isfinite(brain_rank) & np.isfinite(model_rank)
         if v.sum() < 3: continue
-        tau, p_two = kendalltau(brain[v], model_rdm[v])
+        tau, p_two = kendalltau(brain_rank[v], model_rank[v])
         if np.isnan(tau): continue
         p_one = p_two/2 if tau > 0 else 1 - (p_two/2)
         rows.append({"Architecture": arch, "Distribution": dist, "Feature": name, "Kendall Tau": float(tau), "P-value (1-sided)": float(p_one)})
@@ -548,15 +2114,26 @@ def run_rsa_with_fdr(Z: np.ndarray, feats: Dict[str, np.ndarray], arch: str, dis
     df["Significant_FDR"] = rej; df["P-value FDR"] = p_corr
     rsa_dir = out_dir / "rsa"
     rsa_dir.mkdir(parents=True, exist_ok=True)
+    if dump_rdms:
+        dump_dir = rsa_dir / "rdm_dumps"
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        np.save(dump_dir / f"brain_{metric}.npy", brain)
+        for feat_name, vec in model_vectors.items():
+            np.save(dump_dir / f"model_{feat_name}.npy", vec)
     out_xlsx = rsa_dir / f"rsa_results_{arch}_{dist}.xlsx"
     df.to_excel(out_xlsx, index=False)
     plt.figure(figsize=(8,5))
     ax = sns.barplot(data=df, x="Feature", y="Kendall Tau", palette="deep")
-    for i, r in enumerate(df.itertuples()):
-        if r.Significant_FDR:
-            ax.text(i, r._4 + 0.02, "*", ha="center", color="red")  # _4 = Kendall Tau
-    plt.title(f"RSA ({arch}, {dist})"); plt.tight_layout()
-    plt.savefig(rsa_dir / f"rsa_bar_{arch}_{dist}.png", dpi=300, bbox_inches="tight"); plt.close()
+    feature_order = [tick.get_text() for tick in ax.get_xticklabels()]
+    ordered = df.set_index("Feature").loc[feature_order]
+    for idx, (feature, row) in enumerate(ordered.iterrows()):
+        if row["Significant_FDR"]:
+            star_y = float(row["Kendall Tau"]) + 0.05
+            ax.text(idx, star_y, "*", ha="center", color="red", fontsize=14)
+    plt.title(f"RSA ({arch}, {dist})")
+    plt.tight_layout()
+    plt.savefig(rsa_dir / f"rsa_bar_{arch}_{dist}.png", dpi=300, bbox_inches="tight")
+    plt.close()
 
 def pairwise_class_rdm(Z: np.ndarray, labels: np.ndarray, arch: str, dist: str, out_dir: Path, metric="cosine"):
     if Z.shape[0] < 2 or labels is None or labels.shape[0] < 2: return
@@ -591,8 +2168,14 @@ def monotonicity_deltaN(Z: np.ndarray, labels: np.ndarray) -> Dict[str, float]:
     rho, p = spearmanr(xs, ys)
     return {"spearman_r": float(rho), "p": float(p), "pairs": len(xs)}
 
-def partial_rsa_numerosity(Z: np.ndarray, labels: np.ndarray, conf: Dict[str, np.ndarray]) -> Dict[str, float]:
-    brain = _compute_brain_rdm(Z, metric="cosine")
+def partial_rsa_numerosity(
+    Z: np.ndarray,
+    labels: np.ndarray,
+    conf: Dict[str, np.ndarray],
+    *,
+    metric: str = "cosine",
+) -> Dict[str, float]:
+    brain = _compute_brain_rdm(Z, metric=metric)
     if brain.size == 0 or labels is None or len(labels) < 2:
         return {"partial_spearman": np.nan, "p": np.nan}
     num_rdm = pdist(labels.reshape(-1,1), metric="euclidean")
@@ -619,6 +2202,23 @@ def _infer_hw_from_batch(batch_tensor) -> Tuple[int, int]:
     if arr.ndim == 3:  # N,H,W
         return int(arr.shape[1]), int(arr.shape[2])
     L = int(np.sqrt(arr.shape[-1])); return L, L
+
+
+def _infer_chw_from_input(batch_tensor) -> Tuple[int, int, int]:
+    if batch_tensor.ndim == 4:
+        return int(batch_tensor.shape[1]), int(batch_tensor.shape[2]), int(batch_tensor.shape[3])
+    if batch_tensor.ndim == 3:
+        return 1, int(batch_tensor.shape[1]), int(batch_tensor.shape[2])
+    if batch_tensor.ndim == 2:
+        total = int(batch_tensor.shape[1])
+        side = int(round(math.sqrt(total)))
+        if side > 0 and side * side == total:
+            return 1, side, side
+        for h in range(side, 0, -1):
+            if total % h == 0:
+                return 1, h, total // h
+        return 1, total, 1
+    raise ValueError("Unsupported input dimensionality for reconstruction metrics.")
 
 def latent_grid_on_pca(model, Z: np.ndarray, base_batch: torch.Tensor, out: Path,
                        anchor_idx=0, pcs=(0,1), steps=7, delta=2.0, seed=42,
@@ -678,6 +2278,8 @@ def latent_grid_on_pca(model, Z: np.ndarray, base_batch: torch.Tensor, out: Path
 # =========================
 # RUNNER per un modello (usa TUTTE le TUE funzioni)
 # =========================
+# NOTE: Legacy implementation kept temporarily for comparison/debugging.
+# It is no longer invoked by `main` and can be removed once the new pipeline is battle-tested.
 def analyze_one_model(
     dataset_path: str,
     dataset_name: str,
@@ -696,6 +2298,9 @@ def analyze_one_model(
     traversal_cfg: Dict[str, Any] | None = None,
     cka_cfg: Dict[str, Any] | None = None,
     mse_cfg: Dict[str, Any] | None = None,
+    afp_cfg: Dict[str, Any] | None = None,
+    ssim_cfg: Dict[str, Any] | None = None,
+    pca_geom_cfg: Dict[str, Any] | None = None,
     behavioral_cfg: Dict[str, Any] | None = None,
     use_wandb: bool = False,
     wandb_project: Optional[str] = None,
@@ -703,824 +2308,85 @@ def analyze_one_model(
     anchor_idx: int = 0,
     seed: int = 42,
 ):
-    # Init (opzionale) W&B — i tuoi probe lo useranno se presente
-    wandb_run = None
-    if use_wandb:
-        try:
-            import wandb
-            wandb_run = wandb.init(project=wandb_project, name=wandb_run_name, reinit=True)
-        except Exception:
-            wandb_run = None
+    """
+    Modern orchestrator for the offline analysis pipeline.
 
-    print(f"🔄 Analyzing {arch_name} — dist={dist_name}")
+    Delegates the heavy lifting to composable helpers so the control flow remains
+    easy to read and extend.
+    """
 
-    # 1) Usa la TUA classe per allineare embeddings & features
-    analyzer = Embedding_analysis(
-        path2data=dataset_path,
-        data_name=dataset_name,
-        model_uniform=model_uniform,
-        model_zipfian=model_zipfian,
+    spec = ModelSpec(
         arch_name=arch_name,
+        distribution=dist_name,
+        dataset_path=Path(dataset_path),
+        dataset_name=dataset_name,
+        model_uniform=Path(model_uniform),
+        model_zipfian=Path(model_zipfian),
         val_size=val_size,
     )
-
-    def _loader_dataset(loader):
-        return getattr(loader, "dataset", None) if loader is not None else None
-
-    if dist_name.lower() == "zipfian":
-        _report_label_coverage("zipf/train", _loader_dataset(getattr(analyzer, "train_dataloader_zipfian", None)))
-        _report_label_coverage("zipf/val", _loader_dataset(getattr(analyzer, "val_dataloader_zipfian", None)))
-        _report_label_coverage("zipf/test", _loader_dataset(getattr(analyzer, "test_dataloader_zipfian", None)))
-    else:
-        _report_label_coverage("uniform/train", _loader_dataset(getattr(analyzer, "train_dataloader_uniform", None)))
-        _report_label_coverage("uniform/val", _loader_dataset(getattr(analyzer, "val_dataloader_uniform", None)))
-        _report_label_coverage("uniform/test", _loader_dataset(getattr(analyzer, "test_dataloader_uniform", None)))
-    out = analyzer._get_encodings()
-
-    # Sorgenti coerenti (usa dist_name come vista principale)
-    Z = np.array(out.get(f"Z_{dist_name}", []), dtype=np.float64)
-    labels = np.array(out.get(f"labels_{dist_name}", []))
-    cumArea = np.array(out.get(f"cumArea_{dist_name}", []))
-    CH = np.array(out.get(f"CH_{dist_name}", []))
-    feats = {"labels": labels, "cumArea": cumArea, "CH": CH}
-
-    inputs_cpu = analyzer.inputs_uniform
-    orig_flat = inputs_cpu.reshape(inputs_cpu.shape[0], -1).numpy()
-
-    out_dir = Path(out_root) / dist_name / arch_name
-    out_dir.mkdir(parents=True, exist_ok=True)
-    # Base batch for decoders/traversals
-    base_batch = analyzer.inputs_uniform
-    tr_cfg = traversal_cfg or {}
-
-    # Power-fit on centroid distances (top-level)
-    pf_dir = out_dir / "powerfit_pairs"
-    pf_dir.mkdir(parents=True, exist_ok=True)
-    x_pairs, y_pairs, pairs_df = build_pairwise_xy(Z, labels, metric="euclidean")
-    pairs_df.to_csv(pf_dir / f"pairs_table_{arch_name}_{dist_name}.csv", index=False)
-    if x_pairs.size > 0:
-        fit = fit_power_loglog_pairs(x_pairs, y_pairs)
-        save_pairs_fit(fit, pf_dir / f"params_{arch_name}_{dist_name}.csv")
-        plot_pairs_fit(
-            x_pairs,
-            y_pairs,
-            fit,
-            pf_dir / f"fit_linear_{arch_name}_{dist_name}.png",
-            f"{arch_name} ({dist_name})",
-        )
-        plot_pairs_fit_loglog(
-            x_pairs,
-            y_pairs,
-            fit,
-            pf_dir / f"fit_loglog_{arch_name}_{dist_name}.png",
-            f"{arch_name} ({dist_name})",
-        )
-        print(
-            f"[PowerFit] {arch_name}/{dist_name}: b={fit['b']:.3f}, R²={fit['r2']:.3f}"
-        )
-        if wandb_run is not None:
-            try:
-                import wandb
-
-                wandb_run.log(
-                    {
-                        "powerfit_pairs/fit_linear": wandb.Image(
-                            str(pf_dir / f"fit_linear_{arch_name}_{dist_name}.png")
-                        ),
-                        "powerfit_pairs/fit_loglog": wandb.Image(
-                            str(pf_dir / f"fit_loglog_{arch_name}_{dist_name}.png")
-                        ),
-                        "powerfit_pairs/b": fit["b"],
-                        "powerfit_pairs/r2": fit["r2"],
-                    }
-                )
-            except Exception:
-                pass
-    else:
-        print(f"[PowerFit] {arch_name}/{dist_name}: no valid centroid pairs for fitting.")
-
-    # CKA between uniform and zipfian representations (layer-wise)
-    if cka_cfg.get("enabled", True):
-        uniform_layers = getattr(analyzer.model_uniform, "layers", [])
-        zipf_layers = getattr(analyzer.model_zipfian, "layers", [])
-        max_layers = min(len(uniform_layers), len(zipf_layers))
-        if max_layers > 0:
-            layers_for_cka = list(range(1, max_layers + 1))
-            base_inputs_flat_tensor = analyzer.inputs_uniform.view(analyzer.inputs_uniform.shape[0], -1).to(torch.float32)
-            models_for_cka = {
-                "uniform": analyzer.model_uniform,
-                "zipfian": analyzer.model_zipfian,
-            }
-            repr_cache: dict[tuple[int, str], np.ndarray] = {}
-
-            def _repr(layer_idx: int, model_tag: str) -> np.ndarray:
-                key = (layer_idx, model_tag)
-                if key in repr_cache:
-                    return repr_cache[key]
-                model = models_for_cka[model_tag]
-                layers_model = getattr(model, "layers", [])
-                upto = min(layer_idx, len(layers_model))
-                device = _get_model_device(model)
-                with torch.no_grad():
-                    cur = base_inputs_flat_tensor.to(device)
-                    for rbm in layers_model[:upto]:
-                        cur = rbm.forward(cur)
-                    arr = cur.detach().cpu().numpy().astype(np.float64)
-                repr_cache[key] = arr
-                return arr
-
-            cka_dir = out_dir / "cka"
-            cka_dir.mkdir(parents=True, exist_ok=True)
-
-            rng = np.random.default_rng(seed)
-            subset_idx = None
-            n_max = cka_cfg.get("n_max", None)
-            if n_max is not None:
-                n_max = int(n_max)
-                if base_inputs_flat_tensor.shape[0] > n_max:
-                    subset_idx = np.sort(rng.choice(base_inputs_flat_tensor.shape[0], size=n_max, replace=False))
-
-            M_lin, namesA, namesB = compute_layerwise_cka(
-                _repr,
-                layers_for_cka,
-                layers_for_cka,
-                tag_A="uniform",
-                tag_B="zipfian",
-                indices=subset_idx,
-                kind="linear",
-                rng=rng,
-            )
-            lin_df = pd.DataFrame(M_lin, index=namesA, columns=namesB)
-            lin_csv = cka_dir / f"cka_linear_{arch_name}.csv"
-            lin_df.to_csv(lin_csv)
-            lin_png = cka_dir / f"cka_linear_{arch_name}.png"
-            plot_cka_heatmap(M_lin, namesA, namesB, f"Linear CKA — {arch_name} (uniform vs zipf)", lin_png)
-
-            M_rbf, _, _ = compute_layerwise_cka(
-                _repr,
-                layers_for_cka,
-                layers_for_cka,
-                tag_A="uniform",
-                tag_B="zipfian",
-                indices=subset_idx,
-                kind="rbf",
-                rng=rng,
-            )
-            rbf_df = pd.DataFrame(M_rbf, index=namesA, columns=namesB)
-            rbf_csv = cka_dir / f"cka_rbf_{arch_name}.csv"
-            rbf_df.to_csv(rbf_csv)
-            rbf_png = cka_dir / f"cka_rbf_{arch_name}.png"
-            plot_cka_heatmap(M_rbf, namesA, namesB, f"RBF CKA — {arch_name} (uniform vs zipf)", rbf_png)
-
-            print(
-                f"[CKA] {arch_name}/{dist_name}: diag linear={np.diag(M_lin).mean():.3f}, "
-                f"diag rbf={np.diag(M_rbf).mean():.3f}"
-            )
-
-            if wandb_run is not None:
-                try:
-                    import wandb
-
-                    wandb_run.log(
-                        {
-                            "cka/linear": wandb.Image(str(lin_png)),
-                            "cka/rbf": wandb.Image(str(rbf_png)),
-                        }
-                    )
-                except Exception:
-                    pass
-
-            perm_cfg = cka_cfg.get("permutation") or {}
-            if perm_cfg.get("enabled", False):
-                n_perm = int(perm_cfg.get("n_perm", 200))
-                perm_rng = np.random.default_rng(seed)
-                records = []
-                for layer in layers_for_cka:
-                    Xa = _repr(layer, "uniform")
-                    Yb = _repr(layer, "zipfian")
-                    if subset_idx is not None:
-                        Xa = Xa[subset_idx]
-                        Yb = Yb[subset_idx]
-                    p_lin = permutation_test_cka(Xa, Yb, n_perm=n_perm, kind="linear", rng=perm_rng)
-                    p_rbf = permutation_test_cka(Xa, Yb, n_perm=n_perm, kind="rbf", rng=perm_rng)
-                    records.append({
-                        "layer": layer,
-                        "p_linear": p_lin,
-                        "p_rbf": p_rbf,
-                    })
-                pd.DataFrame(records).to_csv(cka_dir / f"cka_permutation_{arch_name}.csv", index=False)
-
-            report_cfg = cka_cfg.get("report", {})
-            if report_cfg.get("enabled", True):
-                try:
-                    report_dir = cka_dir / "report"
-                    acts_uniform_report: list[np.ndarray] = []
-                    acts_zipf_report: list[np.ndarray] = []
-                    for layer in layers_for_cka:
-                        Xa = _repr(layer, "uniform")
-                        Yb = _repr(layer, "zipfian")
-                        if subset_idx is not None:
-                            Xa = Xa[subset_idx]
-                            Yb = Yb[subset_idx]
-                        acts_uniform_report.append(Xa)
-                        acts_zipf_report.append(Yb)
-
-                    generate_report(
-                        acts_uniform_report,
-                        acts_zipf_report,
-                        outdir=report_dir,
-                        layer_names_uniform=namesA,
-                        layer_names_zipf=namesB,
-                        kernels=report_cfg.get("kernels", ["linear", "rbf"]),
-                        gamma=report_cfg.get("gamma", None),
-                        bootstrap=int(report_cfg.get("bootstrap", 200)),
-                        ridge_tau=float(report_cfg.get("ridge_tau", 0.1)),
-                        null_permutations=int(report_cfg.get("null_permutations", 1000)),
-                        seed=int(report_cfg.get("seed", seed)),
-                    )
-                except Exception as exc:
-                    print(f"[CKA report] Impossibile generare gli asset slide-ready ({exc})")
-        else:
-            print(f"[CKA] {arch_name}/{dist_name}: no layers available for comparison.")
-    else:
-        print(f"[CKA] {arch_name}/{dist_name}: skipped (cka.enabled=False)")
-
-    # Behavioral analysis (optional)
-    behavioral_cfg = behavioral_cfg or {}
-    tasks_cfg = behavioral_cfg.get("tasks", {}) if isinstance(behavioral_cfg, dict) else {}
-    model_for_behavior = analyzer.model_uniform if dist_name == "uniform" else analyzer.model_zipfian
-    behaviors_dir = out_dir / "behavioral"
-    behavior_label = f"{arch_name}_{dist_name}"
-    behavioral_inputs = None
-    device_behavior: torch.device | None = None
-    if behavioral_cfg.get("enabled", False):
-        train_path = behavioral_cfg.get("train_pickle")
-        test_path = behavioral_cfg.get("test_pickle")
-        mat_path = behavioral_cfg.get("mat_file")
-        if train_path and test_path and mat_path:
-            try:
-                device_behavior = _get_model_device(model_for_behavior)
-                behavioral_inputs = load_behavioral_inputs(
-                    Path(train_path),
-                    Path(test_path),
-                    Path(mat_path),
-                    device_behavior,
-                )
-            except Exception as exc:
-                print(f"[Behavioral] Impossibile caricare i dataset ({exc})")
-        else:
-            print("[Behavioral] Percorsi mancanti: train_pickle/test_pickle/mat_file")
-
-    if behavioral_inputs is not None:
-        results_beh = run_behavioral_analysis(
-            model_for_behavior,
-            behavioral_inputs,
-            behaviors_dir,
-            behavior_label,
-            guess_rate=float(behavioral_cfg.get("guess_rate", 0.01)),
-        )
-        if wandb_run is not None:
-            try:
-                import wandb
-
-                wandb_run.log(
-                    {
-                        "behavioral/accuracy_test": results_beh.get("accuracy_test"),
-                        "behavioral/accuracy_train": results_beh.get("accuracy_train"),
-                        "behavioral/beta_number": results_beh.get("beta_number"),
-                        "behavioral/beta_size": results_beh.get("beta_size"),
-                        "behavioral/beta_spacing": results_beh.get("beta_spacing"),
-                        "behavioral/weber_fraction": results_beh.get("weber_fraction"),
-                    }
-                )
-            except Exception:
-                pass
-
-        comparison_cfg = tasks_cfg.get("comparison", {})
-        if comparison_cfg.get("enabled", False):
-            out_cmp = behaviors_dir / "comparison"
-            guess_rate_cmp = float(comparison_cfg.get("guess_rate", behavioral_cfg.get("guess_rate", 0.01)))
-            try:
-                comparison_inputs = behavioral_inputs
-                cmp_train = comparison_cfg.get("train_pickle")
-                cmp_test = comparison_cfg.get("test_pickle")
-                if cmp_train and cmp_test:
-                    cmp_mat = comparison_cfg.get("mat_file") or behavioral_cfg.get("mat_file")
-                    comparison_inputs = load_behavioral_inputs(
-                        Path(cmp_train),
-                        Path(cmp_test),
-                        Path(cmp_mat) if cmp_mat else Path(behavioral_cfg.get("mat_file")),
-                        device_behavior,
-                    )
-                results_cmp = run_task_comparison(
-                    model_for_behavior,
-                    comparison_inputs,
-                    out_cmp,
-                    behavior_label,
-                    guess_rate=guess_rate_cmp,
-                )
-                if wandb_run is not None:
-                    wandb_run.log(
-                        {
-                            "behavioral/comparison/accuracy_test": results_cmp.get("accuracy_test"),
-                            "behavioral/comparison/accuracy_train": results_cmp.get("accuracy_train"),
-                            "behavioral/comparison/weber_fraction": results_cmp.get("weber_fraction"),
-                            "behavioral/comparison/beta_number": results_cmp.get("beta_number"),
-                        }
-                    )
-            except Exception as exc:
-                print(f"[Behavioral] Task comparison fallito: {exc}")
-
-        fixed_cfg = tasks_cfg.get("fixed_reference", {})
-        if fixed_cfg.get("enabled", False):
-            refs = fixed_cfg.get("references", [])
-            train_template = fixed_cfg.get("train_template")
-            test_template = fixed_cfg.get("test_template")
-            mat_path = fixed_cfg.get("mat_file") or behavioral_cfg.get("mat_file")
-            if not (train_template and test_template and mat_path):
-                print("[Behavioral] Percorsi mancanti per fixed_reference")
-            else:
-                for ref in refs:
-                    try:
-                        train_path = Path(train_template.format(ref=ref))
-                        test_path = Path(test_template.format(ref=ref))
-                        fixed_inputs = load_fixed_reference_inputs(
-                            train_path,
-                            test_path,
-                            Path(mat_path),
-                            device_behavior or _get_model_device(model_for_behavior),
-                        )
-                        results_fixed = run_task_fixed_reference(
-                            model_for_behavior,
-                            fixed_inputs,
-                            behaviors_dir / "fixed_reference",
-                            behavior_label,
-                            ref_num=int(ref),
-                            guess_rate=float(fixed_cfg.get("guess_rate", behavioral_cfg.get("guess_rate", 0.01))),
-                        )
-                        if wandb_run is not None:
-                            wandb_run.log(
-                                {
-                                    f"behavioral/fixed_reference/{ref}/accuracy_test": results_fixed.get("accuracy_test"),
-                                    f"behavioral/fixed_reference/{ref}/weber_fraction": results_fixed.get("weber_fraction"),
-                                }
-                            )
-                    except Exception as exc:
-                        print(f"[Behavioral] Fixed reference {ref} fallito: {exc}")
-
-    estimation_cfg = tasks_cfg.get("estimation", {})
-    if estimation_cfg.get("enabled", False):
-        ds_map = estimation_cfg.get("datasets")
-        if isinstance(ds_map, DictConfig):
-            ds_map = OmegaConf.to_container(ds_map, resolve=True)
-        ds_entry = None
-        if isinstance(ds_map, dict):
-            ds_entry = ds_map.get(dist_name) or ds_map.get("default") or ds_map.get("all")
-        if ds_entry is None:
-            ds_entry = {
-                "train_pickle": estimation_cfg.get("train_pickle"),
-                "test_pickle": estimation_cfg.get("test_pickle"),
-            }
-        if isinstance(ds_entry, DictConfig):
-            ds_entry = OmegaConf.to_container(ds_entry, resolve=True)
-        train_est = ds_entry.get("train_pickle")
-        test_est = ds_entry.get("test_pickle")
-        if train_est and test_est:
-            try:
-                train_est_path = Path(train_est)
-                if not train_est_path.is_absolute():
-                    train_est_path = PROJECT_ROOT / train_est_path
-                test_est_path = Path(test_est)
-                if not test_est_path.is_absolute():
-                    test_est_path = PROJECT_ROOT / test_est_path
-                device_est = _get_model_device(model_for_behavior)
-                train_ds = load_estimation_dataset(train_est_path, device_est)
-                test_ds = load_estimation_dataset(test_est_path, device_est)
-                est_dir = behaviors_dir / "estimation"
-                est_summary = run_task_numerosity_estimation(
-                    model_for_behavior,
-                    train_ds,
-                    test_ds,
-                    est_dir,
-                    behavior_label,
-                    classifiers=estimation_cfg.get("classifiers"),
-                    label_mode=estimation_cfg.get("label_mode", "int"),
-                    scale_targets=bool(estimation_cfg.get("scale_targets", False)),
-                    max_numerosity=estimation_cfg.get("max_numerosity"),
-                    distribution=dist_name,
-                    max_display_classes=int(estimation_cfg.get("max_display_classes", 32)),
-                    wandb_run=wandb_run,
-                )
-                if wandb_run is not None and est_summary:
-                    try:
-                        import wandb
-                        wandb_run.log(
-                            {
-                                "behavioral/estimation/results_csv": str(est_summary.get("results_path")),
-                                "behavioral/estimation/per_class_csv": str(est_summary.get("per_class_path")),
-                            }
-                        )
-                    except Exception:
-                        pass
-            except Exception as exc:
-                print(f"[Behavioral] Numerosity estimation fallita ({exc})")
-        else:
-            print(f"[Behavioral] Dataset numerosity estimation mancante per {dist_name}")
-
-    hist_dir = out_dir / "label_histograms"
-    hist_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        plot_label_histogram(
-            np.asarray(analyzer.dataset_uniform.labels),
-            title=f"Label Histogram (uniform)",
-            save_path=hist_dir / "uniform.png",
-        )
-    except Exception as exc:
-        print(f"[Labels] Impossibile generare histogramma uniform: {exc}")
-    try:
-        plot_label_histogram(
-            np.asarray(analyzer.dataset_zipfian.labels),
-            title=f"Label Histogram (zipfian)",
-            save_path=hist_dir / "zipfian.png",
-        )
-    except Exception as exc:
-        print(f"[Labels] Impossibile generare histogramma zipfian: {exc}")
-
-    # Helper to save simple 2D/3D plots locally in addition to your W&B plots
-    def _save_basic_plots(emb: np.ndarray, features: dict, method: str, target_dir: Path, title_prefix: str):
-        target_dir.mkdir(parents=True, exist_ok=True)
-        feats_to_plot = [
-            ("Labels", features.get("Labels")),
-            ("Cumulative Area", features.get("cumArea")),
-            ("Convex Hull", features.get("CH")),
-        ]
-        valid = [(name, vals) for name, vals in feats_to_plot if vals is not None and len(vals) == emb.shape[0]]
-        if not valid:
-            return
-        if emb.shape[1] == 2:
-            fig, axes = plt.subplots(1, len(valid), figsize=(6 * len(valid), 5))
-            if len(valid) == 1:
-                axes = [axes]
-            for ax, (fname, vals) in zip(axes, valid):
-                sc = ax.scatter(emb[:, 0], emb[:, 1], c=vals, cmap="viridis", s=20, alpha=0.85)
-                ax.set_title(fname)
-                ax.set_xlabel(f"{method}-1")
-                ax.set_ylabel(f"{method}-2")
-                fig.colorbar(sc, ax=ax, shrink=0.8)
-            fig.suptitle(f"{title_prefix} — {method} 2D", fontsize=14)
-            fig.tight_layout(rect=[0, 0, 1, 0.94])
-            fig.savefig(target_dir / f"{method}_2d_overview.png", dpi=220)
-            plt.close(fig)
-        if emb.shape[1] == 3:
-            from mpl_toolkits.mplot3d import Axes3D  # noqa
-            fig = plt.figure(figsize=(6 * len(valid), 5))
-            for idx, (fname, vals) in enumerate(valid, start=1):
-                ax = fig.add_subplot(1, len(valid), idx, projection='3d')
-                sc = ax.scatter(emb[:, 0], emb[:, 1], emb[:, 2], c=vals, cmap="viridis", s=16, alpha=0.8)
-                ax.set_title(fname)
-                ax.set_xlabel(f"{method}-1")
-                ax.set_ylabel(f"{method}-2")
-                ax.set_zlabel(f"{method}-3")
-                fig.colorbar(sc, ax=ax, shrink=0.7, pad=0.08)
-            fig.suptitle(f"{title_prefix} — {method} 3D", fontsize=14)
-            fig.tight_layout(rect=[0, 0, 1, 0.94])
-            fig.savefig(target_dir / f"{method}_3d_overview.png", dpi=220)
-            plt.close(fig)
-
-    # (Top-level reductions and metrics now run per-layer only)
-
-    # 3) PROBE — usa i TUOI probe con adapter
-    # Costruisci features dict nel formato atteso dai probe (nomi tolleranti)
-    # N.B.: labels le recuperano direttamente dal val_loader; passarle qui non fa male
-    ds = analyzer.val_dataloader_uniform.dataset
-    idxs = getattr(ds, "indices", np.arange(len(ds)))
-    base = getattr(ds, "dataset", ds)
-    cumArea_list = [base.cumArea_list[i] for i in idxs] if hasattr(base, "cumArea_list") else None
-    CH_list      = [base.CH_list[i] for i in idxs] if hasattr(base, "CH_list") else None
-    density_list = [base.density_list[i] for i in idxs] if hasattr(base, "density_list") else None
-    mean_item_size_list = [base.mean_item_size_list[i] for i in idxs] if hasattr(base, "mean_item_size_list") else None
-
-    features_for_probes = {}
-    if cumArea_list is not None: features_for_probes["Cumulative Area"] = np.asarray(cumArea_list)
-    if CH_list is not None:      features_for_probes["Convex Hull"]     = np.asarray(CH_list)
-    if density_list is not None: features_for_probes["Density"]          = np.asarray(density_list)
-    if mean_item_size_list is not None: features_for_probes["Mean Item Size"] = np.asarray(mean_item_size_list)
-    # numerosity (labels) – necessario per includere il target "labels" nei probe
-    if labels is not None and len(labels) > 0:
-        features_for_probes["Labels"] = np.asarray(labels)
-    # (Labels le ricava il probe dal val_loader; ok così)
-
-    feature_dir = out_dir / "feature_analysis"
-    feature_dir.mkdir(parents=True, exist_ok=True)
-    corr_features: Dict[str, np.ndarray] = {}
-    if labels.size:
-        corr_features["labels"] = labels.astype(float)
-    if cumArea.size:
-        corr_features["cumArea"] = cumArea.astype(float)
-    if CH.size:
-        corr_features["CH"] = CH.astype(float)
-    density_arr = features_for_probes.get("Density")
-    if density_arr is not None and len(density_arr) == labels.size:
-        corr_features["Density"] = density_arr.astype(float)
-    mean_arr = features_for_probes.get("Mean Item Size")
-    if mean_arr is not None and len(mean_arr) == labels.size:
-        corr_features["mean_item_size"] = mean_arr.astype(float)
-
-    if corr_features:
-        corr_df = pd.DataFrame(corr_features)
-        rename_map = {
-            "labels": "Numerosity",
-            "cumArea": "Cumulative Area",
-            "CH": "Convex Hull",
-            "Density": "Density",
-            "mean_item_size": "Mean Item Size",
+    settings = AnalysisSettings.from_cfg(
+        {
+            "reductions": reductions_cfg or {},
+            "probing": probing_cfg or {},
+            "rsa": rsa_cfg or {},
+            "rdm": rdm_cfg or {},
+            "monotonicity": monotonicity_cfg or {},
+            "partial_rsa": partial_rsa_cfg or {},
+            "traversal": traversal_cfg or {},
+            "cka": cka_cfg or {},
+            "mse": mse_cfg or {},
+            "afp": afp_cfg or {},
+            "ssim": ssim_cfg or {},
+            "pca_geometry": pca_geom_cfg or {},
+            "behavioral": behavioral_cfg or {},
         }
-        corr_df.rename(columns=rename_map, inplace=True)
-        corr_df = corr_df.rename(columns=rename_map)
-        if "labels" in corr_df:
-            mask = corr_df["Numerosity"] > 5
-            corr_df = corr_df[mask]
-        corr_matrix = corr_df.corr(method="kendall")
-        corr_matrix.to_csv(feature_dir / f"feature_correlations_{dist_name}.csv")
-        plt.figure(figsize=(6, 4))
-        sns.heatmap(
-            corr_matrix,
-            annot=True,
-            fmt=".2f",
-            cmap="viridis",
-            cbar=True,
-            square=True,
-        )
-        plt.title(f"Feature Correlations — {arch_name} ({dist_name})")
-        plt.xticks(rotation=45, ha="right")
-        plt.yticks(rotation=0)
-        plt.tight_layout()
-        plt.savefig(feature_dir / f"feature_correlations_{dist_name}.png", dpi=300)
-        plt.close()
-
-    # Scegli il modello giusto per i probe (uniform/zipfian) — tipicamente uniform per coerenza
-    model_for_probe = analyzer.model_uniform if dist_name == "uniform" else analyzer.model_zipfian
-    pr_cfg = probing_cfg or {}
-    layers = pr_cfg.get("layers", ["top"]) if pr_cfg.get("enabled", True) else []
-    for layer in layers:
-        upto = None if str(layer).lower() == "top" else int(layer)
-        layer_tag = "top" if upto is None else f"layer{upto}"
-        prm = ProbeReadyModel(
-            raw_model=model_for_probe,
-            val_loader=analyzer.val_dataloader_uniform,  # stesso batch coerente usato per Z
-            features_dict=features_for_probes,
-            out_dir=out_dir / "probes" / layer_tag,
-            wandb_run=wandb_run
-        )
-        summary_rows = log_linear_probe(
-            model=prm,
-            epoch=0,
-            n_bins=int(pr_cfg.get("n_bins", 5)),
-            test_size=float(pr_cfg.get("test_size", 0.2)),
-            steps=int(pr_cfg.get("steps", 1000)),
-            lr=float(pr_cfg.get("lr", 1e-2)),
-            rng_seed=int(seed),
-            patience=int(pr_cfg.get("patience", 20)),
-            min_delta=0.0,
-            save_csv=True,
-            upto_layer=upto,
-            layer_tag=layer_tag,
-        )
-        if summary_rows:
-            probe_dir = out_dir / "probes" / layer_tag
-            probe_dir.mkdir(parents=True, exist_ok=True)
-            df_probe = pd.DataFrame(summary_rows, columns=["metric", "accuracy"])
-            df_probe.to_csv(probe_dir / "probe_summary.csv", index=False)
-            plt.figure(figsize=(max(6, len(summary_rows) * 1.2), 4))
-            sns.barplot(data=df_probe, x="metric", y="accuracy", color="steelblue", errorbar=None)
-            plt.ylim(0, 1)
-            plt.ylabel("Accuracy")
-            plt.xlabel("")
-            plt.xticks(rotation=45, ha="right")
-            plt.title(f"Linear probe accuracy — {arch_name} ({dist_name}) [{layer_tag}]")
-            plt.tight_layout()
-            plt.savefig(probe_dir / "probe_summary.png", dpi=300)
-            plt.close()
-
-    # (Top-level RSA/RDM/monotonicity/partial/traversal now executed per-layer only)
-    red_flags = reductions_cfg or {}
-    mse_cfg = mse_cfg or {}
-    cka_cfg = cka_cfg or {}
-
-    # 6) Analisi per-layer (1..K) con salvataggi in cartelle separate
-    model_sel = analyzer.model_uniform if dist_name == "uniform" else analyzer.model_zipfian
-    layers = getattr(model_sel, "layers", [])
-    if layers:
-        device = _get_model_device(model_sel)
-        layer_reps: list[np.ndarray] = []
-        layer_states: list[torch.Tensor] = []
-        with torch.no_grad():
-            inputs_device = inputs_cpu.to(device).view(inputs_cpu.shape[0], -1)
-            cur = inputs_device
-            for li, rbm in enumerate(layers, start=1):
-                cur = rbm.forward(cur)
-                layer_states.append(cur.detach())
-                layer_reps.append(cur.detach().cpu().numpy())
-            del inputs_device
-        for li, Zl in enumerate(layer_reps, start=1):
-            ldir = out_dir / "layers" / f"layer{li}"
-            ldir.mkdir(parents=True, exist_ok=True)
-            # per-layer monotonicity: complete set of visuals + summary
-            mono_l = ldir / "monotonicity"; mono_l.mkdir(parents=True, exist_ok=True)
-            cm_l, cls_l = compute_class_centroids(Zl, labels)
-            D_l = pairwise_centroid_distances(cm_l, metric="euclidean")
-            stats_l1 = plot_distance_vs_deltaN(D_l, cls_l, mono_l / "deltaN_vs_distance.png")
-            plot_violin_by_deltaN(D_l, cls_l, mono_l / "violin_by_deltaN.png")
-            plot_centroid_heatmap(D_l, cls_l, mono_l / "centroid_heatmap.png")
-            stats_l2 = plot_ordinal_trajectory_1d(cm_l, cls_l, mono_l / "ordinal_trajectory_1d.png")
-            plot_ordinal_trajectory_2d(cm_l, cls_l, mono_l / "ordinal_trajectory_2d.png")
-            save_deltaN_stats_csv(D_l, cls_l, mono_l / "deltaN_stats.csv")
-            outliers_info = stats_l1.get("outliers", []) if isinstance(stats_l1, dict) else []
-            if outliers_info:
-                plot_outlier_pairs(
-                    analyzer.dataset_uniform,
-                    cm_l,
-                    cls_l,
-                    outliers_info,
-                    mono_l / "outlier_pairs.png",
-                )
-                save_outlier_pairs_csv(outliers_info, mono_l / "outlier_pairs.csv")
-            stats_summary = {k: v for k, v in stats_l1.items() if k != "outliers"}
-            stats_summary.update(stats_l2)
-            pd.DataFrame([stats_summary]).to_csv(mono_l / "monotonicity_summary.csv", index=False)
-            if wandb_run is not None:
-                try:
-                    import wandb
-                    wandb_payload = {
-                        f"monotonicity/layer{li}/deltaN_vs_distance": wandb.Image(str(mono_l / "deltaN_vs_distance.png")),
-                        f"monotonicity/layer{li}/violin_by_deltaN": wandb.Image(str(mono_l / "violin_by_deltaN.png")),
-                        f"monotonicity/layer{li}/centroid_heatmap": wandb.Image(str(mono_l / "centroid_heatmap.png")),
-                        f"monotonicity/layer{li}/ordinal_trajectory_1d": wandb.Image(str(mono_l / "ordinal_trajectory_1d.png")),
-                        f"monotonicity/layer{li}/ordinal_trajectory_2d": wandb.Image(str(mono_l / "ordinal_trajectory_2d.png")),
-                    }
-                    if outliers_info:
-                        wandb_payload[f"monotonicity/layer{li}/outlier_pairs"] = wandb.Image(str(mono_l / "outlier_pairs.png"))
-                    wandb_run.log(wandb_payload)
-                except Exception:
-                    pass
-            # reductions + plots
-            red_dir_l = ldir / "reductions"; red_dir_l.mkdir(parents=True, exist_ok=True)
-            reductions_l = compute_reductions(
-                Zl,
-                seed=seed,
-                enable_tsne=bool(red_flags.get("tsne", {}).get("enabled", True)),
-                enable_mds=bool(red_flags.get("mds", {}).get("enabled", True)),
-                enable_umap=bool(red_flags.get("umap", {}).get("enabled", False)),
-            )
-            reduction_title_prefix = f"{arch_name} - {dist_name} - Layer {li}"
-            for name, emb in reductions_l.items():
-                method = name.split("_")[0].upper()
-                if emb.shape[1] == 2:
-                    _ = plot_2d_embedding_and_correlations(
-                        emb_2d=emb,
-                        features={"Labels": labels, "cumArea": cumArea, "CH": CH},
-                        arch_name=arch_name,
-                        dist_name=f"{dist_name}/layer{li}",
-                        method_name=method,
-                        wandb_run=wandb_run
-                    )
-                if emb.shape[1] == 3:
-                    _ = plot_3d_embedding_and_correlations(
-                        emb_3d=emb,
-                        features={"Labels": labels, "cumArea": cumArea, "CH": CH},
-                        arch_name=arch_name,
-                        dist_name=f"{dist_name}/layer{li}",
-                        method_name=method,
-                        wandb_run=wandb_run
-                    )
-                _save_basic_plots(
-                    emb,
-                    {"Labels": labels, "cumArea": cumArea, "CH": CH},
-                    method,
-                    red_dir_l,
-                    reduction_title_prefix,
-                )
-            if mse_cfg.get("enabled", True):
-                mse_dir = ldir / "mse"; mse_dir.mkdir(parents=True, exist_ok=True)
-                layer_state = layer_states[li - 1].clone()
-                with torch.no_grad():
-                    rec = layer_state
-                    for rbm_back in reversed(layers[:li]):
-                        rec = rbm_back.backward(rec)
-                recon_flat = rec.detach().cpu().view(orig_flat.shape[0], -1).numpy()
-                del rec
-                mses = compute_sample_mse(orig_flat, recon_flat)
-                df_mse, bin_info = prepare_mse_dataframe(
-                    mses=mses,
-                    numerosity=labels,
-                    cum_area=cumArea,
-                    convex_hull=CH,
-                    n_bins=int(mse_cfg.get("n_bins", 5)),
-                )
-                df_mse.to_csv(mse_dir / "mse_samples.csv", index=False)
-                plot_mse_heatmap(
-                    df_mse,
-                    row_col="cumarea_bin",
-                    col_col="numerosity",
-                    out_path=mse_dir / "heatmap_cumarea_vs_numerosity.png",
-                    title=f"{arch_name} - {dist_name} - Layer {li} - MSE (cum-area vs numerosity)",
-                    row_label="Cum-area bin",
-                    col_label="Numerosity",
-                    ascending=False,
-                )
-                plot_mse_heatmap(
-                    df_mse,
-                    row_col="convex_hull_bin",
-                    col_col="numerosity",
-                    out_path=mse_dir / "heatmap_convex_hull_vs_numerosity.png",
-                    title=f"{arch_name} - {dist_name} - Layer {li} - MSE (convex hull vs numerosity)",
-                    row_label="Convex-hull bin",
-                    col_label="Numerosity",
-                    ascending=False,
-                )
-                plot_mse_vs_numerosity(
-                    df_mse,
-                    feature_col="cumarea_bin",
-                    feature_label="Cum-area bin",
-                    out_path=mse_dir / "mse_vs_numerosity_by_cumarea.png",
-                    title=f"{arch_name} - {dist_name} - Layer {li} - MSE vs numerosity",
-                )
-                coeff_df, summary_txt, reg_metrics = save_regression_results(df_mse, mse_dir)
-                summary_stats = {
-                    "mean_mse": float(df_mse["mse"].mean()),
-                    "std_mse": float(df_mse["mse"].std()),
-                    "n_samples": int(df_mse.shape[0]),
-                }
-                pd.DataFrame([summary_stats]).to_csv(mse_dir / "mse_summary.csv", index=False)
-                with open(mse_dir / "bin_edges.json", "w", encoding="utf-8") as f:
-                    json.dump({k: [float(vv) for vv in v] for k, v in bin_info.items()}, f, indent=2)
-                if wandb_run is not None:
-                    try:
-                        import wandb
-                        wandb_run.log({
-                            f"mse/layer{li}/heatmap_cumarea": wandb.Image(str(mse_dir / "heatmap_cumarea_vs_numerosity.png")),
-                            f"mse/layer{li}/heatmap_convex_hull": wandb.Image(str(mse_dir / "heatmap_convex_hull_vs_numerosity.png")),
-                            f"mse/layer{li}/mse_vs_numerosity": wandb.Image(str(mse_dir / "mse_vs_numerosity_by_cumarea.png")),
-                            f"mse/layer{li}/mean_mse": summary_stats["mean_mse"],
-                            f"mse/layer{li}/std_mse": summary_stats["std_mse"],
-                        })
-                        coeff_table = wandb.Table(dataframe=coeff_df)
-                        wandb_run.log({
-                            f"mse/layer{li}/regression_coefficients": coeff_table,
-                            f"mse/layer{li}/regression_summary": wandb.Html(f"<pre>{summary_txt}</pre>"),
-                            f"mse/layer{li}/regression_r2": reg_metrics.get("r2", math.nan),
-                            f"mse/layer{li}/regression_adj_r2": reg_metrics.get("adj_r2", math.nan),
-                        })
-                    except Exception:
-                        pass
-                del layer_state
-            # RSA/RDM/monotonicity/partial
-            if (rsa_cfg or {}).get("enabled", True):
-                run_rsa_with_fdr(Zl, feats, arch_name, f"{dist_name}_layer{li}", ldir, alpha=float((rsa_cfg or {}).get("alpha", 0.01)))
-            if (rdm_cfg or {}).get("enabled", True):
-                for m in (rdm_cfg or {}).get("metrics", ["cosine", "euclidean"]):
-                    pairwise_class_rdm(Zl, labels, arch_name, f"{dist_name}_layer{li}", ldir, metric=m)
-            if (monotonicity_cfg or {}).get("enabled", True):
-                mon = monotonicity_deltaN(Zl, labels)
-                pd.DataFrame([mon]).to_csv(ldir / "monotonicity.csv", index=False)
-            if (partial_rsa_cfg or {}).get("enabled", True):
-                prs = partial_rsa_numerosity(Zl, labels, {"cumArea": cumArea, "CH": CH})
-                pd.DataFrame([prs]).to_csv(ldir / "partial_rsa.csv", index=False)
-            # Latent traversal from this layer's latent
-            if tr_cfg.get("enabled", True):
-                latent_dir_l = ldir / "latent"; latent_dir_l.mkdir(parents=True, exist_ok=True)
-                pcs = tuple(tr_cfg.get("pcs", [0, 1]))
-                steps_tr = int(tr_cfg.get("steps", 7))
-                delta_tr = float(tr_cfg.get("delta", 2.0))
-                latent_grid_on_pca(
-                    model_sel, Zl, base_batch,
-                    latent_dir_l / "grid_pc0_pc1.png",
-                    anchor_idx=anchor_idx, pcs=pcs, steps=steps_tr, delta=delta_tr, seed=seed,
-                    start_layer=li
-                )
-
-    # 6) Recon grid opzionale su W&B (se vuoi)
-    # orig, rec = analyzer.reconstruct_input(input_type=dist_name)
-    # if wandb_run is not None:
-    #     log_reconstructions_to_wandb(orig, rec, step=0, num_images=8, name=f"recon_{arch_name}_{dist_name}")
-
-    maybe_generate_monotonicity_comparisons(
-        arch_name=arch_name,
-        out_root=out_root,
-        dist_name=dist_name,
-        monotonicity_cfg=monotonicity_cfg,
-        seed=seed,
-        wandb_run=wandb_run,
     )
 
-    if wandb_run is not None:
-        try:
-            import wandb
-            wandb_run.finish()
-        except Exception:
-            pass
+    wandb_run = _maybe_init_wandb(use_wandb, wandb_project, wandb_run_name)
+    print(f"🔄 Analyzing {spec.arch_name} — dist={spec.distribution}")
+    try:
+        ctx = _prepare_model_context(spec, Path(out_root), seed, wandb_run=wandb_run)
+        _save_label_histograms(ctx.analyzer, ctx.output_dir)
 
-    print(f"✅ Completed analysis for {arch_name} ({dist_name}) → {out_dir}")
+        _run_powerfit_pairs(ctx)
+        features_for_probes, density_np, mean_arr = _build_probe_features(
+            ctx.analyzer,
+            ctx.bundle,
+            ctx.output_dir,
+            spec.arch_name,
+            spec.distribution,
+        )
+        _run_linear_probes(
+            ctx.analyzer,
+            features_for_probes,
+            arch_name=spec.arch_name,
+            dist_name=spec.distribution,
+            out_dir=ctx.output_dir,
+            probing_cfg=settings.probing,
+            seed=seed,
+            wandb_run=wandb_run,
+        )
+        _run_layerwise_analysis(
+            ctx,
+            settings,
+            density=density_np,
+            mean_item_size=mean_arr,
+            anchor_idx=anchor_idx,
+        )
+        _run_cka_analysis(ctx, settings)
+        _run_behavioral_suite(ctx, settings.behavioral)
+        maybe_generate_monotonicity_comparisons(
+            arch_name=spec.arch_name,
+            out_root=Path(out_root),
+            dist_name=spec.distribution,
+            monotonicity_cfg=settings.monotonicity,
+            seed=seed,
+            wandb_run=wandb_run,
+        )
+    finally:
+        _finish_wandb(wandb_run)
+
+    print(f"✅ Completed analysis for {spec.arch_name} ({spec.distribution}) → {ctx.output_dir}")
 
 # =========================
 # HYDRA MAIN
@@ -1614,6 +2480,9 @@ def main(cfg: DictConfig):
             traversal_cfg=cfg.get("traversal", {}),
             cka_cfg=cfg.get("cka", {}),
             mse_cfg=cfg.get("mse", {}),
+            afp_cfg=cfg.get("afp", {}),
+            ssim_cfg=cfg.get("ssim", {}),
+            pca_geom_cfg=cfg.get("pca_geometry", {}),
             behavioral_cfg=model_behavioral_cfg,
             use_wandb=use_wandb,
             wandb_project=wandb_project,

@@ -621,14 +621,20 @@ def generate_report(
             outdir / f"cka_matrix_{kernel}.csv",
         )
 
-        mean, ci_lo, ci_hi = bootstrap_diagonal(
-            acts_uniform,
-            acts_zipf,
-            kernel=kernel,
-            B=bootstrap,
-            gamma=gamma,
-            random_state=seed,
-        )
+        if bootstrap > 0:
+            mean, ci_lo, ci_hi = bootstrap_diagonal(
+                acts_uniform,
+                acts_zipf,
+                kernel=kernel,
+                B=bootstrap,
+                gamma=gamma,
+                random_state=seed,
+            )
+        else:
+            diag_vals = np.diag(matrix)
+            mean = diag_vals
+            ci_lo = diag_vals
+            ci_hi = diag_vals
         diag_labels = layer_names_uniform[: len(mean)]
         diagonal_entries.append(DiagonalBootstrap(kernel=kernel, mean=mean, ci_lo=ci_lo, ci_hi=ci_hi))
 
@@ -659,15 +665,16 @@ def generate_report(
         out_path=outdir / "cka_intra_model_progress.png",
     )
 
-    null_values, observed = _null_test(
-        acts_uniform,
-        acts_zipf,
-        kernel=primary_kernel,
-        gamma=gamma,
-        permutations=null_permutations,
-        random_state=seed,
-    )
-    _plot_null_test(null_values, observed, kernel=primary_kernel, out_path=outdir / "cka_null_test.png")
+    if null_permutations > 0:
+        null_values, observed = _null_test(
+            acts_uniform,
+            acts_zipf,
+            kernel=primary_kernel,
+            gamma=gamma,
+            permutations=null_permutations,
+            random_state=seed,
+        )
+        _plot_null_test(null_values, observed, kernel=primary_kernel, out_path=outdir / "cka_null_test.png")
 
     _plot_mini_intro(outdir / "cka_mini_intro.png")
 

@@ -42,8 +42,8 @@ TEST_MAT_7_28 = SOURCE_DIR / "NumStim_7to28_100x100_TE.mat"
 
 # Naming (estimation) parameters
 MIN_NUM = 1
-MAX_NUM = 15
-SAMPLES_PER_NUM = 1500  # -> 225 batches (100 each)
+MAX_NUM = 32
+SAMPLES_PER_NUM = 1500  # -> 480 batches (100 each)
 LIMITS_NAMING = np.array([MIN_NUM - 1, MAX_NUM, 41])
 PERCENTAGES_NAMING = np.array([0, 100, 0])
 LIMIT_RADIUS = 45

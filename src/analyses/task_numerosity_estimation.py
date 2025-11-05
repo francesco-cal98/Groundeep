@@ -119,6 +119,7 @@ def plot_confusion_matrix(
     model_label: str,
     out_path: Path,
     max_display_classes: int = 32,
+    save_csv: bool = False,
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     labels = np.unique(np.concatenate([y_true, y_pred]))
@@ -133,7 +134,14 @@ def plot_confusion_matrix(
         cm_percent[np.isnan(cm_percent)] = 0.0
 
     fig, ax = plt.subplots(figsize=(8, 7))
-    im = ax.imshow(cm_percent, cmap=plt.cm.viridis, vmin=0.0, vmax=1.0, aspect="auto")
+    im = ax.imshow(
+        cm_percent,
+        cmap=plt.cm.viridis,
+        vmin=0.0,
+        vmax=1.0,
+        aspect="auto",
+        origin="lower",
+    )
     cbar = fig.colorbar(im, ax=ax)
     cbar.ax.set_ylabel("Proportion", rotation=270, labelpad=15)
 
@@ -147,6 +155,11 @@ def plot_confusion_matrix(
     fig.tight_layout()
     fig.savefig(out_path, dpi=220)
     plt.close(fig)
+
+    if save_csv:
+        df_percent = pd.DataFrame(cm_percent, index=labels, columns=labels)
+        csv_path = out_path.with_suffix(".csv")
+        df_percent.to_csv(csv_path)
 
 
 def _flatten_tensor(tensor: torch.Tensor) -> np.ndarray:
@@ -196,8 +209,22 @@ def run_task_numerosity_estimation(
     if not valid_classifiers:
         raise ValueError("[Estimation] Nessun classifier valido specificato.")
 
-    X_train_repr = forwardDBN(model, X_train).clone()
-    X_test_repr = forwardDBN(model, X_test).clone()
+    def _forward_safe(batch_tensor):
+        try:
+            return forwardDBN(model, batch_tensor).clone()
+        except RuntimeError as exc:
+            if "CUDA out of memory" in str(exc) or "CUBLAS_STATUS_ALLOC_FAILED" in str(exc):
+                print("[Estimation] CUDA OOM detected, retrying on CPU.")
+                torch.cuda.empty_cache()
+                model_device = torch.device("cpu")
+                if hasattr(model, "to"):
+                    model.to(model_device)
+                with torch.no_grad():
+                    return forwardDBN(model, batch_tensor.to(model_device)).clone().cpu()
+            raise
+
+    X_train_repr = _forward_safe(X_train)
+    X_test_repr = _forward_safe(X_test)
 
     results_rows: List[MutableMapping[str, object]] = []
     prediction_records: List[MutableMapping[str, object]] = []
@@ -276,6 +303,7 @@ def run_task_numerosity_estimation(
             model_label=model_label,
             out_path=output_dir / f"confusion_{model_label}_{name}.png",
             max_display_classes=max_display_classes,
+            save_csv=True,
         )
 
         if wandb_run is not None:

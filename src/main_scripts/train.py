@@ -63,13 +63,27 @@ def run_training(config_path: Path | None = None):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    train_loader, val_loader, _ = create_dataloaders_uniform(
-        data_path=config['dataset_path'],
-        data_name=config['dataset_name'],
-        batch_size=config['batch_size'],
-        num_workers=config['num_workers'],
-        multimodal_flag=config['multimodal_flag']
-    )
+    distribution = str(config.get("dataset_distribution", "uniform")).lower()
+    if distribution == "zipfian":
+        print("[Training] Using Zipfian-weighted dataloader.")
+        train_loader, val_loader, _ = create_dataloaders_zipfian(
+            data_path=config['dataset_path'],
+            data_name=config['dataset_name'],
+            batch_size=config['batch_size'],
+            num_workers=config['num_workers'],
+            multimodal_flag=config['multimodal_flag']
+        )
+    elif distribution == "uniform":
+        print("[Training] Using uniform dataloader.")
+        train_loader, val_loader, _ = create_dataloaders_uniform(
+            data_path=config['dataset_path'],
+            data_name=config['dataset_name'],
+            batch_size=config['batch_size'],
+            num_workers=config['num_workers'],
+            multimodal_flag=config['multimodal_flag']
+        )
+    else:
+        raise ValueError(f"Unknown dataset_distribution '{distribution}'. Expected 'uniform' or 'zipfian'.")
 
     
 

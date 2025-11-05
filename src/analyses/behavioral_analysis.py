@@ -14,11 +14,7 @@ from CCNL_readout_DBN import forwardDBN, classifier, beta_extraction
 
 
 def _to_tensor(arr, device, dtype=torch.float32):
-    tensor = torch.tensor(arr, dtype=dtype, device=device)
-    arr_max = float(np.max(arr))
-    if arr_max > 1.0 + 1e-6:
-        tensor = tensor / 255.0
-    return tensor
+    return torch.tensor(arr, dtype=dtype, device=device)
 
 
 def load_behavioral_inputs(
@@ -32,11 +28,11 @@ def load_behavioral_inputs(
     with open(test_pickle, "rb") as f:
         test_dict = pickle.load(f)
 
-    X_train = _to_tensor(train_dict["data"], device=device, dtype=torch.float32)
+    X_train = _to_tensor(train_dict["data"], device=device, dtype=torch.float32) / 255.0
     Y_train = _to_tensor(train_dict["labels"], device=device, dtype=torch.float32)
     idx_train = _to_tensor(train_dict["idxs"], device=device, dtype=torch.float32)
 
-    X_test = _to_tensor(test_dict["data"], device=device, dtype=torch.float32)
+    X_test = _to_tensor(test_dict["data"], device=device, dtype=torch.float32) / 255.0
     Y_test = _to_tensor(test_dict["labels"], device=device, dtype=torch.float32)
     idx_test = _to_tensor(test_dict["idxs"], device=device, dtype=torch.float32)
 

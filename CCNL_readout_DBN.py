@@ -22,25 +22,8 @@ def forwardrbm(self, v):
     p_h = torch.sigmoid(torch.matmul(v.float(), self.W) + self.hid_bias)
     h = (p_h > torch.rand_like(p_h)).float()  # Stochastic activation
     return p_h, h
-def _iter_layers(model):
-    layers = None
-    if hasattr(model, "layers"):
-        layers = getattr(model, "layers")
-    elif isinstance(model, dict):
-        layers = model.get("layers")
-    elif hasattr(model, "__getitem__"):
-        try:
-            layers = model["layers"]
-        except KeyError:
-            layers = None
-    if layers is None:
-        raise TypeError("DBN model does not expose 'layers'.")
-    return layers
-
-
-def forwardDBN(model, X):
-    layers = _iter_layers(model)
-    for rbm in layers:
+def forwardDBN(self, X):
+    for rbm in self.layers:
         # Ensure tensors are created on the correct device
         _X = torch.zeros([X.shape[0], X.shape[1], rbm.num_hidden], device=DEVICE)
         Xtorch = torch.zeros(X.shape[1], rbm.num_hidden, device=DEVICE)  # Intermediate tensor
@@ -126,12 +109,7 @@ def irls_fit(choice, X, guessRate=0.01, max_iter=5000, tol=1e-12):
 
         # Update beta using weighted least squares
         WX = W[:, np.newaxis] * X_design
-        lhs = np.dot(WX.T, X_design)
-        rhs = np.dot(WX.T, z)
-        try:
-            beta_new = np.linalg.solve(lhs, rhs)
-        except np.linalg.LinAlgError:
-            beta_new = np.linalg.lstsq(lhs, rhs, rcond=None)[0]
+        beta_new = np.linalg.solve(np.dot(WX.T, X_design), np.dot(WX.T, z))
 
         # Check for convergence
         if np.linalg.norm(beta_new - beta) < tol:

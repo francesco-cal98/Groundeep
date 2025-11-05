@@ -35,6 +35,7 @@ config.local.json
 *.json
 *.wandb
 *.wndpos
+*.md
 
 # Ignora le cartelle di log specifiche del tuo progetto
 logs-gdbn/

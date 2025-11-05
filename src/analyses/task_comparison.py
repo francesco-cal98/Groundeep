@@ -26,11 +26,11 @@ def _sgd_classifier(
     y_train: torch.Tensor,
     y_test: torch.Tensor,
 ):
-    Xtr = X_train.view(-1, X_train.shape[2]).cpu().numpy()
-    Xte = X_test.view(-1, X_test.shape[2]).cpu().numpy()
+    Xtr = X_train.view(-1, X_train.shape[2]).detach().cpu().numpy()
+    Xte = X_test.view(-1, X_test.shape[2]).detach().cpu().numpy()
 
-    Ytr = y_train.reshape(-1, y_train.shape[-1]).cpu().numpy()
-    Yte = y_test.reshape(-1, y_test.shape[-1]).cpu().numpy()
+    Ytr = y_train.reshape(-1, y_train.shape[-1]).detach().cpu().numpy()
+    Yte = y_test.reshape(-1, y_test.shape[-1]).detach().cpu().numpy()
 
     ytr = Ytr[:, 1].reshape(-1)
     yte = Yte[:, 1].reshape(-1)
@@ -68,7 +68,16 @@ def _irls_fit(
         z = linear + (choice - prob) / (response_rate * norm.pdf(linear))
 
         WX = w[:, None] * X_design
-        beta_new = np.linalg.solve(WX.T @ X_design, WX.T @ z)
+        lhs = WX.T @ X_design
+        rhs = WX.T @ z
+
+        # Piccola regolarizzazione per evitare matrici singolari
+        reg = 1e-6 * np.eye(lhs.shape[0], dtype=lhs.dtype)
+        lhs = lhs + reg
+        try:
+            beta_new = np.linalg.solve(lhs, rhs)
+        except np.linalg.LinAlgError:
+            beta_new = np.linalg.lstsq(lhs, rhs, rcond=None)[0]
 
         if np.linalg.norm(beta_new - beta) < tol:
             beta = beta_new
