@@ -1,0 +1,274 @@
+# =============================================================================
+# GROUNDEEP Modular Analysis Pipeline - Full Configuration Example
+# =============================================================================
+# Questo file mostra TUTTE le opzioni disponibili per ogni stage.
+# Copia le sezioni che ti servono in analysis.yaml
+
+# Global Settings
+# -----------------------------------------------------------------------------
+seed: 42
+use_wandb: false
+wandb_project: numerosity-offline
+output_root: results/analysis
+val_size: 0.05
+anchor: 0
+
+# Layer Configuration (applies to all stages that support it)
+# -----------------------------------------------------------------------------
+# Options:
+#   - 'top': analizza solo l'ultimo layer (default)
+#   - 'all': analizza tutti i layer
+#   - [1, 2, 3]: analizza solo i layer specificati
+layers: top
+
+# =============================================================================
+# STAGE 1: Power-Law Scaling
+# =============================================================================
+# Questa stage è sempre attiva e non ha configurazione.
+# Analizza la relazione power-law tra distanze e differenze numeriche.
+
+# =============================================================================
+# STAGE 2: Linear Probes
+# =============================================================================
+probing:
+  enabled: true
+  layers: [top]        # Layers da analizzare per i probes
+  n_bins: 5            # Bins per cumArea e convexHull
+  test_size: 0.2       # Frazione del dataset per test
+  steps: 1000          # Training steps
+  lr: 0.01             # Learning rate
+  patience: 20         # Early stopping patience
+
+# =============================================================================
+# STAGE 3: Geometry Stage
+# =============================================================================
+# Analisi geometriche delle rappresentazioni: RSA, RDM, monotonicity, partial RSA
+
+# RSA (Representational Similarity Analysis)
+# -----------------------------------------------------------------------------
+rsa:
+  enabled: true
+  alpha: 0.01          # Soglia per FDR correction
+  metric: cosine       # Metrica: cosine | euclidean | correlation
+  dump_rdms: false     # Salva le matrici RDM complete
+
+# RDM (Representational Dissimilarity Matrix)
+# -----------------------------------------------------------------------------
+rdm:
+  enabled: true
+  metrics: [cosine, euclidean]  # Metriche di distanza da computare
+
+# Monotonicity Analysis
+# -----------------------------------------------------------------------------
+monotonicity:
+  enabled: true
+  # Analizza se le distanze nei centroidi rispettano l'ordine numerosità
+
+# Partial RSA
+# -----------------------------------------------------------------------------
+partial_rsa:
+  enabled: true
+  # RSA controllando per variabili confondenti (cumArea, convexHull)
+
+# =============================================================================
+# STAGE 4: Reconstruction Stage
+# =============================================================================
+# Metriche di qualità della ricostruzione: MSE, AFP, SSIM
+
+# MSE (Mean Squared Error)
+# -----------------------------------------------------------------------------
+mse:
+  enabled: true
+  n_bins: 5            # Bins per discretizzare cumArea e convexHull
+
+# AFP (Area Fraction Preserved)
+# -----------------------------------------------------------------------------
+afp:
+  enabled: true
+  n_bins: 5            # Metrica basata su FFT (dominio delle frequenze)
+
+# SSIM (Structural Similarity Index)
+# -----------------------------------------------------------------------------
+ssim:
+  enabled: true
+  n_bins: 5            # Metrica di similarità percettuale
+
+# =============================================================================
+# STAGE 5: Dimensionality Stage
+# =============================================================================
+# Riduzioni dimensionali e analisi geometriche: PCA, TSNE, UMAP
+
+# PCA Geometry
+# -----------------------------------------------------------------------------
+pca_geometry:
+  enabled: true
+  per_class: 200       # Campioni per classe per balanced PCA
+  isomap: false        # Abilita visualizzazione Isomap dei centroidi
+
+# PCA Decomposition Report
+# -----------------------------------------------------------------------------
+pca_report:
+  enabled: true
+  random_state: 42     # Seed per riproducibilità
+
+# TSNE
+# -----------------------------------------------------------------------------
+tsne:
+  enabled: false       # Disabilitato di default (lento)
+  perplexity: 30       # Parametro perplexity (5-50 tipicamente)
+  n_iter: 1000         # Numero di iterazioni
+  max_samples: 5000    # Subsample se dataset > max_samples
+  random_state: 42
+
+# UMAP
+# -----------------------------------------------------------------------------
+umap:
+  enabled: true
+  n_neighbors: 15      # Numero di vicini (default: 15)
+  min_dist: 0.1        # Distanza minima tra punti (0.0-0.99)
+  max_samples: 5000    # Subsample se dataset > max_samples
+  random_state: 42
+
+# Legacy (mantenuto per compatibilità)
+# -----------------------------------------------------------------------------
+reductions:
+  pca:   {enabled: true}
+  tsne:  {enabled: false}
+  mds:   {enabled: false}
+  umap:  {enabled: true}
+
+traversal:
+  enabled: true
+  pcs: [0, 1]          # Principal components da attraversare
+  steps: 7             # Numero di step lungo ogni PC
+  delta: 2.0           # Ampiezza dello step (in unità std)
+
+# =============================================================================
+# STAGE 6: CKA Stage
+# =============================================================================
+# Centered Kernel Alignment - Similarità tra rappresentazioni di due modelli
+
+cka:
+  enabled: false       # Disabilitato di default
+  kernels: [linear]    # Kernel: linear | rbf
+  n_max: 1024          # Max samples per calcolo CKA (per memoria)
+  report:
+    enabled: true
+    bootstrap: 0       # Numero di bootstrap samples (0 = no bootstrap)
+    null_permutations: 0  # Permutazioni per null hypothesis
+  permutation:
+    enabled: false
+    n_perm: 200        # Numero di permutazioni per test statistico
+
+# =============================================================================
+# STAGE 7: Behavioral Stage
+# =============================================================================
+# Suite di task comportamentali: comparison, fixed reference, estimation
+
+behavioral:
+  enabled: true
+  train_pickle: behavioral_datasets/binary_de_wind_train.pkl
+  test_pickle: behavioral_datasets/binary_de_wind_test.pkl
+  mat_file: circle_dataset_100x100/NumStim_7to28_100x100_TE.mat
+  guess_rate: 0.01
+
+  tasks:
+    # Comparison Task
+    # -------------------------------------------------------------------------
+    comparison:
+      enabled: true
+      guess_rate: 0.01
+      train_pickle: behavioral_datasets/binary_de_wind_train.pkl
+      test_pickle: behavioral_datasets/binary_de_wind_test.pkl
+      mat_file: circle_dataset_100x100/NumStim_7to28_100x100_TE.mat
+
+    # Fixed Reference Task
+    # -------------------------------------------------------------------------
+    fixed_reference:
+      enabled: true
+      references: [8, 14, 16, 20]  # Numerosità di riferimento
+      train_template: behavioral_datasets/fixed_ref_REF_{ref}_train.pkl
+      test_template: behavioral_datasets/fixed_ref_REF_{ref}_test.pkl
+      mat_file: circle_dataset_100x100/NumStim_1to32_100x100_TE.mat
+      guess_rate: 0.01
+
+    # Estimation/Naming Task
+    # -------------------------------------------------------------------------
+    estimation:
+      enabled: true
+      datasets:
+        uniform:
+          train_pickle: behavioral_datasets/naming_train.pkl
+          test_pickle: behavioral_datasets/naming_test.pkl
+        zipfian:
+          train_pickle: behavioral_datasets/naming_train.pkl
+          test_pickle: behavioral_datasets/naming_test.pkl
+      classifiers: [SGD_regression]  # SGD_regression | RandomForest | etc
+      label_mode: int                 # int | float
+      scale_targets: false
+      max_display_classes: 32
+
+# =============================================================================
+# MODEL CONFIGURATIONS
+# =============================================================================
+
+models:
+  # Modello 1: iDBN uniform
+  # ---------------------------------------------------------------------------
+  - arch: iDBN_1500_500
+    distribution: uniform
+    dataset_path: /home/student/Desktop/Groundeep/stimuli_dataset_10_10
+    dataset_name: stimuli_dataset.npz
+    model_uniform: /home/student/Desktop/Groundeep/networks/uniform/dataset_10_10/uniform_i_/dbn_trained_uniform_1500_500.pkl
+    model_zipfian: /home/student/Desktop/Groundeep/networks/zipfian/dataset_10_10/zipfian_i_/dbn_trained_zipfian_1500_500.pkl
+    val_size: 0.10
+
+  # Modello 2: iDBN zipfian
+  # ---------------------------------------------------------------------------
+  - arch: iDBN_1500_500
+    distribution: zipfian
+    dataset_path: /home/student/Desktop/Groundeep/stimuli_dataset_10_10
+    dataset_name: stimuli_dataset.npz
+    model_uniform: /home/student/Desktop/Groundeep/networks/uniform/dataset_10_10/uniform_i_/dbn_trained_uniform_1500_500.pkl
+    model_zipfian: /home/student/Desktop/Groundeep/networks/zipfian/dataset_10_10/zipfian_i_/dbn_trained_zipfian_1500_500.pkl
+    val_size: 0.10
+
+# =============================================================================
+# ESEMPI DI USO
+# =============================================================================
+
+# Esempio 1: Analizzare solo il top layer con RSA e MSE
+# -----------------------------------------------------------------------------
+# layers: top
+# rsa: {enabled: true}
+# mse: {enabled: true}
+# rdm: {enabled: false}
+# monotonicity: {enabled: false}
+# afp: {enabled: false}
+# ssim: {enabled: false}
+
+# Esempio 2: Analizzare tutti i layer con tutte le metriche di ricostruzione
+# -----------------------------------------------------------------------------
+# layers: all
+# mse: {enabled: true, n_bins: 5}
+# afp: {enabled: true, n_bins: 5}
+# ssim: {enabled: true, n_bins: 5}
+
+# Esempio 3: Analizzare layer 1, 2, 3 solo con PCA e UMAP
+# -----------------------------------------------------------------------------
+# layers: [1, 2, 3]
+# pca_geometry: {enabled: true, per_class: 200}
+# pca_report: {enabled: true}
+# umap: {enabled: true, n_neighbors: 15}
+# rsa: {enabled: false}
+# mse: {enabled: false}
+
+# Esempio 4: Quick analysis (solo essenziali)
+# -----------------------------------------------------------------------------
+# layers: top
+# rsa: {enabled: true}
+# monotonicity: {enabled: true}
+# pca_geometry: {enabled: true}
+# mse: {enabled: true}
+# behavioral: {enabled: false}
+# cka: {enabled: false}

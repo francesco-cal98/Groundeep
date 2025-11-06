@@ -1,3 +1,9 @@
+# =============================================================================
+# GROUNDEEP Modular Analysis Pipeline Configuration
+# =============================================================================
+
+# Global Settings
+# -----------------------------------------------------------------------------
 seed: 42
 use_wandb: false
 wandb_project: numerosity-offline
@@ -5,29 +11,93 @@ output_root: results/analysis
 val_size: 0.05
 anchor: 0
 
-reductions:
-  pca:   {enabled: true}
-  tsne:  {enabled: false}
-  mds:   {enabled: false}
-  umap:  {enabled: true}
+# Layer Configuration (applies to all stages that support it)
+# -----------------------------------------------------------------------------
+# Options: 'top' | 'all' | [1, 2, 3]
+layers: top
 
+# =============================================================================
+# ANALYSIS STAGES
+# =============================================================================
+
+# Stage 1: Power-Law Scaling
+# -----------------------------------------------------------------------------
+# Automatically enabled, no configuration needed
+
+# Stage 2: Linear Probes
+# -----------------------------------------------------------------------------
 probing:
   enabled: true
-  layers: [top]   # opzionale: [top, 1, 2, 3]
+  layers: [top]   # Specific layer configuration for probes
   n_bins: 5
   test_size: 0.2
   steps: 1000
   lr: 0.01
   patience: 20
 
+# Stage 3: Geometry Stage (RSA, RDM, Monotonicity, Partial RSA)
+# -----------------------------------------------------------------------------
 rsa:
   enabled: true
-  alpha: 0.01
-  metric: cosine
+  alpha: 0.01          # FDR correction threshold
+  metric: cosine       # cosine | euclidean | correlation
   dump_rdms: false
-rdm: {enabled: true, metrics: [cosine, euclidean]}
-monotonicity: {enabled: true}
-partial_rsa: {enabled: true}
+
+rdm:
+  enabled: true
+  metrics: [cosine, euclidean]  # Distance metrics to compute
+
+monotonicity:
+  enabled: true
+
+partial_rsa:
+  enabled: true
+
+# Stage 4: Reconstruction Stage (MSE, AFP, SSIM)
+# -----------------------------------------------------------------------------
+mse:
+  enabled: true
+  n_bins: 5            # Number of bins for feature discretization
+
+afp:
+  enabled: true
+  n_bins: 5            # Area Fraction Preserved (FFT-based metric)
+
+ssim:
+  enabled: true
+  n_bins: 5            # Structural Similarity Index
+
+# Stage 5: Dimensionality Stage (PCA, TSNE, UMAP)
+# -----------------------------------------------------------------------------
+pca_geometry:
+  enabled: true
+  per_class: 200       # Samples per class for balanced PCA
+  isomap: false        # Enable Isomap visualization
+
+pca_report:
+  enabled: true
+  random_state: 42     # For reproducibility
+
+tsne:
+  enabled: false
+  perplexity: 30       # TSNE perplexity parameter
+  n_iter: 1000         # Number of iterations
+  max_samples: 5000    # Subsample if dataset is larger
+  random_state: 42
+
+umap:
+  enabled: true
+  n_neighbors: 15      # UMAP n_neighbors parameter
+  min_dist: 0.1        # UMAP min_dist parameter
+  max_samples: 5000    # Subsample if dataset is larger
+  random_state: 42
+
+# Legacy: kept for backwards compatibility
+reductions:
+  pca:   {enabled: true}
+  tsne:  {enabled: false}
+  mds:   {enabled: false}
+  umap:  {enabled: true}
 
 traversal:
   enabled: true
@@ -35,27 +105,12 @@ traversal:
   steps: 7
   delta: 2.0
 
-pca_geometry:
-  enabled: true
-  per_class: 200
-  isomap: false
-
-mse:
-  enabled: true
-  n_bins: 5
-
-afp:
-  enabled: true
-  n_bins: 5
-
-ssim:
-  enabled: true
-  n_bins: 5
-
+# Stage 6: CKA Stage
+# -----------------------------------------------------------------------------
 cka:
-  enabled: true
-  kernels: [linear]
-  n_max: 1024
+  enabled: false
+  kernels: [linear]    # linear | rbf
+  n_max: 1024          # Max samples for CKA computation
   report:
     enabled: true
     bootstrap: 0
@@ -64,6 +119,8 @@ cka:
     enabled: false
     n_perm: 200
 
+# Stage 7: Behavioral Stage
+# -----------------------------------------------------------------------------
 behavioral:
   enabled: true
   train_pickle: behavioral_datasets/binary_de_wind_train.pkl
@@ -97,6 +154,10 @@ behavioral:
       label_mode: int
       scale_targets: false
       max_display_classes: 32
+
+# =============================================================================
+# MODEL CONFIGURATIONS
+# =============================================================================
 
 models:
   - arch: iDBN_1500_500
