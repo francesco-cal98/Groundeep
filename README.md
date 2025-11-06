@@ -1,11 +1,11 @@
-# Groundeep 🧠  
+# Groundeep 
 **Emergent Structure and Grounding in Deep Belief Networks**
 
 > *Groundeep* is an ongoing research framework dedicated to studying how structured, interpretable representations emerge in **unsupervised Deep Belief Networks (DBN)** and how these internal representations can be **anchored (grounded)** across modalities such as vision, text, and number concepts.
 
 ---
 
-## 🌍 Project Overview
+##  Project Overview
 
 Groundeep originates from a long-term investigation into **multimodal Deep Belief Networks** (iMDBN).  
 It extends those experiments by providing a **systematic environment** for analyzing and stabilizing the dynamics of DBN training — from *unimodal pretraining* to *cross-modal grounding*.
@@ -16,7 +16,7 @@ The central research question is:
 
 ---
 
-## 🚧 Current Focus
+##  Current Focus
 
 This repository captures the **intermediate state** of that exploration.  
 Models, scripts, and diagnostics evolve rapidly as new hypotheses are tested.
@@ -32,7 +32,7 @@ Models, scripts, and diagnostics evolve rapidly as new hypotheses are tested.
 
 ---
 
-## 🧩 Conceptual Architecture
+## Conceptual Architecture
     [ Image Encoder DBN ]          [ Text Encoder RBM ]
                ↓                           ↓
        z_img latent space          z_txt latent space
