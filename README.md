@@ -41,13 +41,7 @@ Models, scripts, and diagnostics evolve rapidly as new hypotheses are tested.
                     ↑           ↑
              Reconstruction and Gibbs flows
 
-    [ Image Encoder DBN ]          [ Text Encoder RBM ]
-               ↓                           ↓
-       z_img latent space          z_txt latent space
-               ↓                           ↓
-        └─────── Joint RBM (z_joint) ───────┘
-                    ↑           ↑
-             Reconstruction and Gibbs flows
+
 
 
 
