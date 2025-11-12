@@ -185,7 +185,9 @@ class BehavioralStage:
                 out_dir = behaviors_dir / "fixed_reference" / f"ref{ref}"
                 results_fr = run_task_fixed_reference(
                     model, fixed_inputs, out_dir,
-                    f"{behavior_label}_ref{ref}", guess_rate=guess_rate
+                    f"{behavior_label}_ref{ref}",
+                    ref_num=ref,
+                    guess_rate=guess_rate
                 )
 
                 if ctx.wandb_run:

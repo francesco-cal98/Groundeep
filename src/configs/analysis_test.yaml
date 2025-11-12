@@ -1,0 +1,176 @@
+# =============================================================================
+# GROUNDEEP Modular Analysis Pipeline Configuration - TEST RUN
+# =============================================================================
+
+# Global Settings
+# -----------------------------------------------------------------------------
+seed: 42
+use_wandb: false
+wandb_project: numerosity-offline
+output_root: results/analysis2
+val_size: 0.05
+anchor: 0
+
+# Layer Configuration (applies to all stages that support it)
+# -----------------------------------------------------------------------------
+# Options: 'top' | 'all' | [1, 2, 3]
+layers: top
+
+# =============================================================================
+# ANALYSIS STAGES
+# =============================================================================
+
+# Stage 1: Power-Law Scaling
+# -----------------------------------------------------------------------------
+# Automatically enabled, no configuration needed
+
+# Stage 2: Linear Probes
+# -----------------------------------------------------------------------------
+probing:
+  enabled: true
+  layers: [top]   # Specific layer configuration for probes
+  n_bins: 5
+  test_size: 0.2
+  steps: 1000
+  lr: 0.01
+  patience: 20
+
+# Stage 3: Geometry Stage (RSA, RDM, Monotonicity, Partial RSA)
+# -----------------------------------------------------------------------------
+rsa:
+  enabled: true
+  alpha: 0.01          # FDR correction threshold
+  metric: cosine       # cosine | euclidean | correlation
+  dump_rdms: false
+
+rdm:
+  enabled: true
+  metrics: [cosine, euclidean]  # Distance metrics to compute
+
+monotonicity:
+  enabled: true
+
+partial_rsa:
+  enabled: true
+
+# Stage 4: Reconstruction Stage (MSE, AFP, SSIM)
+# -----------------------------------------------------------------------------
+mse:
+  enabled: true
+  n_bins: 5            # Number of bins for feature discretization
+
+afp:
+  enabled: true
+  n_bins: 5            # Area Fraction Preserved (FFT-based metric)
+
+ssim:
+  enabled: true
+  n_bins: 5            # Structural Similarity Index
+
+# Stage 5: Dimensionality Stage (PCA, TSNE, UMAP)
+# -----------------------------------------------------------------------------
+pca_geometry:
+  enabled: true
+  per_class: 200       # Samples per class for balanced PCA
+  isomap: false        # Enable Isomap visualization
+
+pca_report:
+  enabled: true
+  random_state: 42     # For reproducibility
+
+tsne:
+  enabled: false
+  perplexity: 30       # TSNE perplexity parameter
+  n_iter: 1000         # Number of iterations
+  max_samples: 5000    # Subsample if dataset is larger
+  random_state: 42
+
+umap:
+  enabled: true
+  n_neighbors: 15      # UMAP n_neighbors parameter
+  min_dist: 0.1        # UMAP min_dist parameter
+  max_samples: 5000    # Subsample if dataset is larger
+  random_state: 42
+
+# Legacy: kept for backwards compatibility
+reductions:
+  pca:   {enabled: true}
+  tsne:  {enabled: false}
+  mds:   {enabled: false}
+  umap:  {enabled: true}
+
+traversal:
+  enabled: true
+  pcs: [0, 1]
+  steps: 7
+  delta: 2.0
+
+# Stage 6: CKA Stage
+# -----------------------------------------------------------------------------
+cka:
+  enabled: false
+  kernels: [linear]    # linear | rbf
+  n_max: 1024          # Max samples for CKA computation
+  report:
+    enabled: true
+    bootstrap: 0
+    null_permutations: 0
+  permutation:
+    enabled: false
+    n_perm: 200
+
+# Stage 7: Behavioral Stage
+# -----------------------------------------------------------------------------
+behavioral:
+  enabled: true
+  train_pickle: behavioral_datasets/binary_de_wind_train.pkl
+  test_pickle: behavioral_datasets/binary_de_wind_test.pkl
+  mat_file: circle_dataset_100x100/NumStim_7to28_100x100_TE.mat
+  guess_rate: 0.01
+  tasks:
+    comparison:
+      enabled: true
+      guess_rate: 0.01
+      train_pickle: behavioral_datasets/binary_de_wind_train.pkl
+      test_pickle: behavioral_datasets/binary_de_wind_test.pkl
+      mat_file: circle_dataset_100x100/NumStim_7to28_100x100_TE.mat
+    fixed_reference:
+      enabled: true
+      references: [8, 14, 16, 20]
+      train_template: behavioral_datasets/fixed_ref_REF_{ref}_train.pkl
+      test_template: behavioral_datasets/fixed_ref_REF_{ref}_test.pkl
+      mat_file: circle_dataset_100x100/NumStim_1to32_100x100_TE.mat
+      guess_rate: 0.01
+    estimation:
+      enabled: true
+      datasets:
+        uniform:
+          train_pickle: behavioral_datasets/naming_train.pkl
+          test_pickle: behavioral_datasets/naming_test.pkl
+        zipfian:
+          train_pickle: behavioral_datasets/naming_train.pkl
+          test_pickle: behavioral_datasets/naming_test.pkl
+      classifiers: [SGD_regression]
+      label_mode: int
+      scale_targets: false
+      max_display_classes: 32
+
+# =============================================================================
+# MODEL CONFIGURATIONS
+# =============================================================================
+
+models:
+  - arch: iDBN_1500_500
+    distribution: uniform
+    dataset_path: /home/student/Desktop/Groundeep/stimuli_dataset_10_10
+    dataset_name: stimuli_dataset.npz
+    model_uniform: /home/student/Desktop/Groundeep/networks/uniform/dataset_10_10/uniform_i_/dbn_trained_uniform_1500_500.pkl
+    model_zipfian: /home/student/Desktop/Groundeep/networks/zipfian/dataset_10_10/zipfian_i_/dbn_trained_zipfian_1500_500.pkl
+    val_size: 0.10
+  - arch: iDBN_1500_500
+    distribution: zipfian
+    dataset_path: /home/student/Desktop/Groundeep/stimuli_dataset_10_10
+    dataset_name: stimuli_dataset.npz
+    model_uniform: /home/student/Desktop/Groundeep/networks/uniform/dataset_10_10/uniform_i_/dbn_trained_uniform_1500_500.pkl
+    model_zipfian: /home/student/Desktop/Groundeep/networks/zipfian/dataset_10_10/zipfian_i_/dbn_trained_zipfian_1500_500.pkl
+    val_size: 0.10

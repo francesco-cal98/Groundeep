@@ -7,7 +7,7 @@
 seed: 42
 use_wandb: false
 wandb_project: numerosity-offline
-output_root: results/analysis
+output_root: results/analysis2
 val_size: 0.05
 anchor: 0
 

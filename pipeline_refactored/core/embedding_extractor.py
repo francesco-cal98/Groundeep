@@ -1,11 +1,12 @@
 """
-EmbeddingExtractor: Clean embedding extraction from models.
+EmbeddingExtractor: Clean embedding extraction from models with adapter support.
 
 Replaces the embedding extraction parts of Embedding_analysis with:
 - Single responsibility: only extracts embeddings
 - Layer-wise extraction support
 - Aligned pair extraction (for model comparison)
 - Reconstruction support
+- Adapter system for model-agnostic extraction
 """
 
 import sys
@@ -20,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from pipeline_refactored.core.model_manager import ModelManager
+from pipeline_refactored.core.adapters import BaseAdapter
 
 
 class EmbeddingExtractor:
@@ -42,14 +44,17 @@ class EmbeddingExtractor:
         >>> Z_layer2 = extractor.extract("uniform", dataloader, layer=2)
     """
 
-    def __init__(self, model_manager: ModelManager):
+    def __init__(self, model_manager: ModelManager, use_adapters: bool = True):
         """
         Initialize the extractor.
 
         Args:
             model_manager: ModelManager instance with loaded models
+            use_adapters: If True, use adapter interface (recommended).
+                         If False, use legacy direct model access.
         """
         self.model_manager = model_manager
+        self.use_adapters = use_adapters
 
     def extract(
         self,
@@ -70,6 +75,63 @@ class EmbeddingExtractor:
         Returns:
             Embeddings as numpy array of shape (N, D)
         """
+        # Use adapter if available and enabled
+        if self.use_adapters:
+            try:
+                return self._extract_with_adapter(model_label, dataloader, layer, verbose)
+            except Exception as e:
+                if verbose:
+                    print(f"[EmbeddingExtractor] Adapter extraction failed: {e}")
+                    print("[EmbeddingExtractor] Falling back to legacy extraction")
+
+        # Fallback to legacy extraction
+        return self._extract_legacy(model_label, dataloader, layer, verbose)
+
+    def _extract_with_adapter(
+        self,
+        model_label: str,
+        dataloader: DataLoader,
+        layer: Optional[int] = None,
+        verbose: bool = False,
+    ) -> np.ndarray:
+        """Extract embeddings using adapter interface (new method)."""
+        adapter = self.model_manager.get_adapter(model_label)
+
+        embeddings = []
+        n_batches = len(dataloader)
+
+        with torch.no_grad():
+            for i, batch in enumerate(dataloader):
+                if verbose and (i % 10 == 0):
+                    print(f"  Batch {i+1}/{n_batches}")
+
+                # Get input (handle both (x,) and (x, y) formats)
+                if isinstance(batch, (list, tuple)):
+                    x = batch[0]
+                else:
+                    x = batch
+
+                # Extract embeddings using adapter
+                if layer is None:
+                    # Top layer
+                    emb = adapter.encode(x)
+                else:
+                    # Specific layer
+                    layer_embs = adapter.encode_layerwise(x, layers=[layer])
+                    emb = layer_embs[0] if layer_embs else adapter.encode(x)
+
+                embeddings.append(emb.detach().cpu().numpy())
+
+        return np.concatenate(embeddings, axis=0)
+
+    def _extract_legacy(
+        self,
+        model_label: str,
+        dataloader: DataLoader,
+        layer: Optional[int] = None,
+        verbose: bool = False,
+    ) -> np.ndarray:
+        """Extract embeddings using legacy direct model access."""
         model = self.model_manager.get_model(model_label)
         device = self.model_manager.get_device(model_label)
 
